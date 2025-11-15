@@ -387,18 +387,18 @@ impl App {
 
     fn copy_selected_message(&mut self) {
         if !self.chat_focus {
-            self.status_line = "Press Ctrl+G to browse chat first.".into();
+            self.show_warning("Press Ctrl+G to browse chat first.");
             return;
         }
         let idx = match self.selected_message {
             Some(idx) => idx,
             None => {
-                self.status_line = "No message selected.".into();
+                self.show_warning("No message selected.");
                 return;
             }
         };
         let Some(entry) = self.messages.get(idx) else {
-            self.status_line = "Selected message is unavailable.".into();
+            self.show_warning("Selected message is unavailable.");
             return;
         };
         let payload = entry.text.clone();
@@ -407,7 +407,7 @@ impl App {
                 self.status_line = format!("Copied message from {}", entry.author);
             }
             Err(err) => {
-                self.status_line = format!("Clipboard error: {err}");
+                self.show_error(format!("Clipboard error: {err}"));
             }
         }
     }
@@ -476,7 +476,7 @@ impl App {
         let read_dir = match fs::read_dir(&dir) {
             Ok(rd) => rd,
             Err(err) => {
-                self.status_line = format!("Cannot read {}: {err}", dir.display());
+                self.show_error(format!("Cannot read {}: {err}", dir.display()));
                 return;
             }
         };
@@ -587,7 +587,7 @@ impl App {
         match self.mode {
             Mode::Chat => {
                 if self.input.trim().is_empty() {
-                    self.status_line = "Cannot send empty message".into();
+                    self.show_warning("Cannot send empty message");
                     return None;
                 }
                 let text = self.input.clone();
@@ -596,7 +596,7 @@ impl App {
             }
             Mode::File => {
                 if self.input.trim().is_empty() {
-                    self.status_line = "Provide a file path".into();
+                    self.show_warning("Provide a file path");
                     return None;
                 }
                 let path = PathBuf::from(self.input.trim());
@@ -611,7 +611,7 @@ impl App {
                     self.input.clear();
                     self.status_line = "Password for peers (blank = open)".into();
                 }
-                Err(_) => self.status_line = "Invalid listen address".into(),
+                Err(_) => self.show_warning("Invalid listen address"),
             },
             Mode::ListenPassword => {
                 if let Some(addr) = self.pending_listen_addr.take() {
@@ -632,7 +632,7 @@ impl App {
                     self.input.clear();
                     self.status_line = "Peer password (blank if none)".into();
                 }
-                Err(_) => self.status_line = "Invalid peer address".into(),
+                Err(_) => self.show_warning("Invalid peer address"),
             },
             Mode::ConnectPassword => {
                 if let Some(addr) = self.pending_connect_addr.take() {
@@ -648,7 +648,7 @@ impl App {
             }
             Mode::Username => {
                 if self.input.trim().is_empty() {
-                    self.status_line = "Nickname cannot be empty".into();
+                    self.show_warning("Nickname cannot be empty");
                     return None;
                 }
                 self.username = self.input.trim().to_string();
@@ -666,7 +666,7 @@ impl App {
                     match trimmed.parse::<Ipv4Addr>() {
                         Ok(ip) => Some(ip),
                         Err(_) => {
-                            self.status_line = "Enter a valid IPv4, e.g. 192.168.0.255".into();
+                            self.show_warning("Enter a valid IPv4, e.g. 192.168.0.255");
                             return None;
                         }
                     }
@@ -682,7 +682,7 @@ impl App {
             Mode::IncomingFile(id) => {
                 let trimmed = self.input.trim();
                 if trimmed.is_empty() {
-                    self.status_line = "Choose a path to save the file".into();
+                    self.show_warning("Choose a path to save the file");
                     return None;
                 }
                 let path = PathBuf::from(trimmed);
@@ -793,8 +793,7 @@ impl App {
                 self.enqueue_offer(offer);
             }
             ServiceEvent::Error { message } => {
-                self.push_error(message.clone());
-                self.status_line = format!("Error: {message}");
+                self.show_error(message);
             }
         }
     }
@@ -851,8 +850,32 @@ impl App {
         self.push_message(MessageDirection::System, text.into());
     }
 
+    fn push_warning(&mut self, text: impl Into<String>) {
+        self.push_message(MessageDirection::Warning, text.into());
+    }
+
     fn push_error(&mut self, text: impl Into<String>) {
         self.push_message(MessageDirection::Error, text.into());
+    }
+
+    fn show_warning(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.status_line = text.clone();
+        self.push_warning(text);
+    }
+
+    fn show_error(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        let preview = text
+            .lines()
+            .next()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .map(|line| line.to_string());
+        self.status_line = preview
+            .map(|line| format!("[x] {line}"))
+            .unwrap_or_else(|| "[x] Error".into());
+        self.push_error(text);
     }
 
     fn clamp_selection(&mut self) {
@@ -897,6 +920,7 @@ pub enum MessageDirection {
     Incoming(String),
     Outgoing(String),
     System,
+    Warning,
     Error,
 }
 
@@ -906,6 +930,7 @@ impl MessageDirection {
             MessageDirection::Incoming(_) => Color::LightCyan,
             MessageDirection::Outgoing(_) => Color::LightGreen,
             MessageDirection::System => Color::Gray,
+            MessageDirection::Warning => Color::Yellow,
             MessageDirection::Error => Color::LightRed,
         }
     }
@@ -915,6 +940,7 @@ impl MessageDirection {
             MessageDirection::Incoming(name) => name,
             MessageDirection::Outgoing(name) => name,
             MessageDirection::System => "system",
+            MessageDirection::Warning => "warning",
             MessageDirection::Error => "error",
         }
     }

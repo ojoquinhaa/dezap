@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
@@ -8,7 +10,7 @@ use crate::service::TransferDirection;
 
 use textwrap::wrap;
 
-use super::app::{App, ConnectionStatus, Mode, PanelFocus};
+use super::app::{App, ConnectionStatus, MessageDirection, Mode, PanelFocus};
 
 const BANNER_LINE: &str = "Retro LAN QUIC Messenger";
 const DEMON_LINES: [&str; 7] = [
@@ -48,7 +50,13 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .timestamp
                 .format(fmt)
                 .unwrap_or_else(|_| "--:--".into());
-            let prefix = format!("[{ts}] {} • ", entry.author);
+            let label: Cow<'_, str> = match &entry.direction {
+                MessageDirection::System => Cow::Borrowed("system"),
+                MessageDirection::Warning => Cow::Borrowed("⚠ warning"),
+                MessageDirection::Error => Cow::Borrowed("⛔ error"),
+                _ => Cow::Borrowed(entry.author.as_str()),
+            };
+            let prefix = format!("[{ts}] {} • ", label);
             let prefix_width = UnicodeWidthStr::width(prefix.as_str());
             let available = inner_width.saturating_sub(prefix_width).max(1);
             let wrapped = wrap(&entry.text, available)
