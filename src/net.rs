@@ -1,3 +1,4 @@
+use std::convert::TryInto;
 use std::fs::File as StdFile;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -265,6 +266,9 @@ fn generate_self_signed(tls: &TlsConfig) -> Result<TlsMaterial> {
     params
         .distinguished_name
         .push(DnType::CommonName, tls.server_name.clone());
+    if let Ok(dns) = tls.server_name.clone().try_into() {
+        params.subject_alt_names.push(SanType::DnsName(dns));
+    }
     params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
