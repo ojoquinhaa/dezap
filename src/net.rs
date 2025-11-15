@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use quinn::crypto::rustls::QuicServerConfig;
 use quinn::rustls::{
     self,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -36,11 +37,15 @@ pub fn bind_server(bind_addr: SocketAddr, tls: &TlsConfig) -> Result<ServerConte
     let tls_material = prepare_server_cert(tls)?;
     let client_config = build_client_config(tls, Some(&tls_material.certs))?;
 
-    let mut server_config = quinn::ServerConfig::with_single_cert(
-        tls_material.certs.clone(),
-        tls_material.key.clone_key(),
-    )
-    .context("failed to build server config")?;
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(tls_material.certs.clone(), tls_material.key.clone_key())
+        .context("failed to build server crypto config")?;
+    server_crypto.alpn_protocols = vec![b"dezap/1".to_vec()];
+
+    let quic_server =
+        QuicServerConfig::try_from(server_crypto).context("failed to convert to quic config")?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
     server_config.transport = default_transport_config();
 
     let mut endpoint =
