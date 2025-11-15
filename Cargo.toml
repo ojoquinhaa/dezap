@@ -44,6 +44,7 @@ rand_core = { version = "0.5", features = ["getrandom"] }
 unicode-width = "*"
 flate2 = "*"
 tempfile = "*"
+textwrap = "*"
 
 # Optional TUI stack; enabled via the default `tui` feature.
 ratatui = { version = "*", optional = true, default-features = false, features = ["crossterm"] }

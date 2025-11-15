@@ -110,6 +110,8 @@ cargo run -- tui
 | `Ctrl+K`       | Connect to a peer                    |
 | `Ctrl+L`       | Start/stop listener                  |
 | `Ctrl+F`       | Send a file                          |
+| `Ctrl+P`       | Focus discovered peers (Enter to connect) |
+| `Ctrl+S`       | Focus saved peers (Enter to connect) |
 | `Ctrl+D`       | Trigger peer discovery               |
 | `Tab`          | Toggle help overlay                  |
 | `Esc`          | Close dialogs                        |

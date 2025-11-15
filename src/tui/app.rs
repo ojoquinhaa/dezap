@@ -15,6 +15,13 @@ use crate::service::{
     TransferDirection,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelFocus {
+    None,
+    Discovered,
+    Saved,
+}
+
 const MAX_MESSAGES: usize = 512;
 
 /// High-level application state powering the TUI.
@@ -44,6 +51,8 @@ pub struct App {
     download_dir: PathBuf,
     offer_queue: VecDeque<FileOfferNotice>,
     active_offer: Option<FileOfferNotice>,
+    panel_focus: PanelFocus,
+    saved_peer_index: usize,
 }
 
 impl App {
@@ -74,6 +83,8 @@ impl App {
             download_dir: config.paths.download_dir.clone(),
             offer_queue: VecDeque::new(),
             active_offer: None,
+            panel_focus: PanelFocus::None,
+            saved_peer_index: 0,
         }
     }
 
@@ -83,6 +94,28 @@ impl App {
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if self.panel_focus != PanelFocus::None {
+            match key.code {
+                KeyCode::Esc => {
+                    self.exit_panel_focus();
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.panel_move_selection(-1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.panel_move_selection(1);
+                    return None;
+                }
+                KeyCode::Enter => {
+                    return self.panel_connect_selection();
+                }
+                _ => {}
+            }
+            return None;
+        }
 
         if self.chat_focus {
             match key.code {
@@ -177,12 +210,17 @@ impl App {
                 return Some(ServiceCommand::Disconnect);
             }
             KeyCode::Char('p') if ctrl => {
-                self.shortcut_to_peer();
+                self.focus_discovered_panel();
+                return None;
             }
             KeyCode::Char('u') if ctrl => {
                 self.mode = Mode::Username;
                 self.input = self.username.clone();
                 self.status_line = "Choose a nickname".into();
+            }
+            KeyCode::Char('s') if ctrl => {
+                self.focus_saved_panel();
+                return None;
             }
             KeyCode::Char('r') if ctrl => {
                 self.mode = Mode::DiscoveryNetwork;
@@ -199,20 +237,6 @@ impl App {
             _ => {}
         }
         None
-    }
-
-    fn shortcut_to_peer(&mut self) {
-        if self.discovered.is_empty() {
-            self.status_line = "No peers discovered yet.".into();
-            return;
-        }
-        self.selected_peer = (self.selected_peer + 1) % self.discovered.len();
-        let addr = self.discovered[self.selected_peer];
-        self.pending_connect_addr = Some(addr);
-        self.mode = Mode::ConnectPassword;
-        self.input.clear();
-        self.status_line =
-            format!("Preparing to connect to {addr}. Enter password (blank if none).");
     }
 
     fn toggle_chat_focus(&mut self) {
@@ -244,6 +268,100 @@ impl App {
     fn leave_chat_focus(&mut self) {
         self.chat_focus = false;
         self.selected_message = None;
+    }
+
+    fn focus_discovered_panel(&mut self) {
+        if self.discovered.is_empty() {
+            self.status_line = "No discovered peers yet.".into();
+            return;
+        }
+        self.selected_peer = self
+            .selected_peer
+            .min(self.discovered.len().saturating_sub(1));
+        self.panel_focus = PanelFocus::Discovered;
+        self.status_line =
+            "Discovered peers focused · ↑/↓ to navigate, Enter to connect, Esc to cancel".into();
+    }
+
+    fn focus_saved_panel(&mut self) {
+        if self.saved_peers.is_empty() {
+            self.status_line = "No saved peers available yet.".into();
+            return;
+        }
+        self.saved_peer_index = self
+            .saved_peer_index
+            .min(self.saved_peers.len().saturating_sub(1));
+        self.panel_focus = PanelFocus::Saved;
+        self.status_line =
+            "Saved peers focused · ↑/↓ to navigate, Enter to connect, Esc to cancel".into();
+    }
+
+    fn exit_panel_focus(&mut self) {
+        self.panel_focus = PanelFocus::None;
+        self.status_line.clear();
+    }
+
+    fn panel_move_selection(&mut self, delta: isize) {
+        match self.panel_focus {
+            PanelFocus::Discovered => {
+                if self.discovered.is_empty() {
+                    return;
+                }
+                let len = self.discovered.len() as isize;
+                let mut next = self.selected_peer as isize + delta;
+                if next < 0 {
+                    next = len - 1;
+                }
+                if next >= len {
+                    next = 0;
+                }
+                self.selected_peer = next as usize;
+                let addr = self.discovered[self.selected_peer];
+                self.status_line = format!("Selected {addr} (Enter to connect)");
+            }
+            PanelFocus::Saved => {
+                if self.saved_peers.is_empty() {
+                    return;
+                }
+                let len = self.saved_peers.len() as isize;
+                let mut next = self.saved_peer_index as isize + delta;
+                if next < 0 {
+                    next = len - 1;
+                }
+                if next >= len {
+                    next = 0;
+                }
+                self.saved_peer_index = next as usize;
+                let peer = &self.saved_peers[self.saved_peer_index];
+                self.status_line = format!("Selected {} ({})", peer.name, peer.addr);
+            }
+            PanelFocus::None => {}
+        }
+    }
+
+    fn panel_connect_selection(&mut self) -> Option<ServiceCommand> {
+        let command = match self.panel_focus {
+            PanelFocus::Discovered if !self.discovered.is_empty() => {
+                let addr = self.discovered[self.selected_peer];
+                Some(ServiceCommand::Connect {
+                    addr,
+                    password: None,
+                })
+            }
+            PanelFocus::Saved if !self.saved_peers.is_empty() => {
+                let addr = self.saved_peers[self.saved_peer_index].addr;
+                Some(ServiceCommand::Connect {
+                    addr,
+                    password: None,
+                })
+            }
+            _ => None,
+        };
+        if command.is_some() {
+            self.exit_panel_focus();
+            self.status_line = "Connecting…".into();
+        }
+        command
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -283,11 +401,7 @@ impl App {
             self.status_line = "Selected message is unavailable.".into();
             return;
         };
-        let stamp = entry
-            .timestamp
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|_| entry.timestamp.unix_timestamp().to_string());
-        let payload = format!("{stamp} {}: {}", entry.author, entry.text);
+        let payload = entry.text.clone();
         match Clipboard::new().and_then(|mut clip| clip.set_text(payload)) {
             Ok(_) => {
                 self.status_line = format!("Copied message from {}", entry.author);
@@ -326,6 +440,32 @@ impl App {
         self.mode = Mode::Chat;
         if let Some(next) = self.offer_queue.pop_front() {
             self.activate_offer(next);
+        }
+    }
+
+    pub fn panel_focus(&self) -> PanelFocus {
+        self.panel_focus
+    }
+
+    pub fn selected_discovered(&self) -> Option<usize> {
+        if self.discovered.is_empty() {
+            None
+        } else {
+            Some(
+                self.selected_peer
+                    .min(self.discovered.len().saturating_sub(1)),
+            )
+        }
+    }
+
+    pub fn selected_saved(&self) -> Option<usize> {
+        if self.saved_peers.is_empty() {
+            None
+        } else {
+            Some(
+                self.saved_peer_index
+                    .min(self.saved_peers.len().saturating_sub(1)),
+            )
         }
     }
 
@@ -635,6 +775,13 @@ impl App {
             },
             ServiceEvent::SavedPeers(list) => {
                 self.saved_peers = list;
+                if self.saved_peers.is_empty() {
+                    self.saved_peer_index = 0;
+                } else {
+                    self.saved_peer_index = self
+                        .saved_peer_index
+                        .min(self.saved_peers.len().saturating_sub(1));
+                }
             }
             ServiceEvent::FileOffer(offer) => {
                 self.push_system(format!(

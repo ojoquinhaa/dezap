@@ -2,11 +2,13 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use time::macros::format_description;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::service::TransferDirection;
 
-use super::app::{App, ConnectionStatus, Mode};
+use textwrap::wrap;
+
+use super::app::{App, ConnectionStatus, Mode, PanelFocus};
 
 const BANNER_LINE: &str = "Retro LAN QUIC Messenger";
 const DEMON_LINES: [&str; 7] = [
@@ -37,6 +39,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let fmt = format_description!("[hour]:[minute]:[second]");
+    let inner_width = area.width.saturating_sub(4).max(10) as usize;
     let items: Vec<ListItem<'static>> = app
         .messages
         .iter()
@@ -46,13 +49,32 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .format(fmt)
                 .unwrap_or_else(|_| "--:--".into());
             let prefix = format!("[{ts}] {} • ", entry.author);
-            ListItem::new(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(Color::Gray)),
-                Span::styled(
-                    entry.text.clone(),
-                    Style::default().fg(entry.direction.style()),
-                ),
-            ]))
+            let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+            let available = inner_width.saturating_sub(prefix_width).max(1);
+            let wrapped = wrap(&entry.text, available)
+                .into_iter()
+                .map(|cow| cow.to_string())
+                .collect::<Vec<_>>();
+            let pieces = if wrapped.is_empty() {
+                vec![String::new()]
+            } else {
+                wrapped
+            };
+            let indent = " ".repeat(prefix_width);
+            let mut lines = Vec::new();
+            if let Some(first) = pieces.first() {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.clone(), Style::default().fg(Color::Gray)),
+                    Span::styled(first.clone(), Style::default().fg(entry.direction.style())),
+                ]));
+                for rest in pieces.iter().skip(1) {
+                    lines.push(Line::from(vec![
+                        Span::raw(indent.clone()),
+                        Span::styled(rest.clone(), Style::default().fg(entry.direction.style())),
+                    ]));
+                }
+            }
+            ListItem::new(lines)
         })
         .collect();
     let title = if app.chat_focus {
@@ -234,13 +256,19 @@ fn draw_discovery(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .collect()
     };
 
+    let mut state = ListState::default();
+    if app.panel_focus() == PanelFocus::Discovered {
+        if let Some(idx) = app.selected_discovered() {
+            state.select(Some(idx));
+        }
+    }
     let list = List::new(items).block(
         Block::default()
-            .title("Peers (Ctrl+P cycles)")
+            .title("Discovered Peers (Ctrl+P)")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.accent)),
     );
-    frame.render_widget(list, area);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_saved_peers(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -255,11 +283,17 @@ fn draw_saved_peers(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let list = List::new(items).block(
         Block::default()
-            .title("Saved Peers")
+            .title("Saved Peers (Ctrl+S)")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.accent)),
     );
-    frame.render_widget(list, area);
+    let mut state = ListState::default();
+    if app.panel_focus() == PanelFocus::Saved {
+        if let Some(idx) = app.selected_saved() {
+            state.select(Some(idx));
+        }
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -273,11 +307,13 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let entries = [
         ("Ctrl+L", "Host listener"),
         ("Ctrl+K", "Connect to peer"),
-        ("Ctrl+P", "Cycle discovered peers"),
+        ("Ctrl+P", "Focus discovered peers"),
+        ("Ctrl+S", "Focus saved peers"),
         ("Ctrl+X", "Disconnect from peer"),
         ("Tab", "Toggle help / autocomplete paths"),
         ("Ctrl+G", "Focus chat history"),
         ("Arrows", "Navigate focused chat"),
+        ("Enter (panel)", "Connect to highlighted peer"),
         ("C (browse)", "Copy highlighted message"),
         ("Ctrl+F", "Send a file"),
         ("Ctrl+U", "Rename yourself"),
