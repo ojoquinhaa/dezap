@@ -1,0 +1,50 @@
+[package]
+name = "dezap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Dezap Contributors"]
+description = "Retro-styled QUIC-based LAN messenger with TUI and CLI frontends."
+
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm"]
+
+[dependencies]
+# Use latest stable versions for every dependency listed below.
+anyhow = { version = "*", features = ["backtrace"] }
+tokio = { version = "*", features = ["full"] }
+quinn = "*"
+rcgen = "*"
+rustls-pemfile = "*"
+rustls = { version = "0.23", default-features = false }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+serde_yaml = "*"
+toml = "*"
+bincode = { version = "*", features = ["serde"] }
+clap = { version = "*", features = ["derive"] }
+config = "*"
+directories = "*"
+shellexpand = "*"
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter", "fmt"] }
+thiserror = "*"
+tokio-stream = "*"
+tokio-util = { version = "*", features = ["codec"] }
+bytes = "*"
+futures = "*"
+parking_lot = "*"
+rand = "*"
+time = { version = "*", features = ["macros", "formatting"] }
+once_cell = "*"
+
+# Optional TUI stack; enabled via the default `tui` feature.
+ratatui = { version = "*", optional = true, default-features = false, features = ["crossterm"] }
+crossterm = { version = "*", optional = true }
+
+[dev-dependencies]
+# Use latest stable versions for dev tooling as well.
+tokio = { version = "*", features = ["full"] }
+tempfile = "*"
+assert_cmd = "*"

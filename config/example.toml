@@ -1,0 +1,28 @@
+[listen]
+bind_addr = "0.0.0.0:5000"
+
+[peer]
+default_peer = "192.168.0.42:5000"
+
+[paths]
+download_dir = "~/dezap/downloads"
+chat_log = "~/dezap/chat.log"
+
+[limits]
+max_message_bytes = 16384
+max_file_bytes = 1073741824
+chunk_size_bytes = 65536
+
+[tls]
+insecure_local = true
+
+[ui]
+accent = "magenta"
+
+[logging]
+level = "info"
+
+[discovery]
+enabled = true
+port = 54095
+response_ttl_ms = 2000
