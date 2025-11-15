@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -25,9 +26,15 @@ pub struct App {
     pub should_quit: bool,
     pub accent: Color,
     pub connection: ConnectionStatus,
+    pub username: String,
+    peer_names: HashMap<SocketAddr, String>,
     default_bind: SocketAddr,
     default_peer: Option<SocketAddr>,
     pub discovery_enabled: bool,
+    pub discovery_target: Option<Ipv4Addr>,
+    pending_listen_addr: Option<SocketAddr>,
+    pending_connect_addr: Option<SocketAddr>,
+    selected_peer: usize,
 }
 
 impl App {
@@ -43,9 +50,15 @@ impl App {
             should_quit: false,
             accent: parse_color(&config.ui.accent),
             connection: ConnectionStatus::Disconnected,
+            username: config.identity.username.clone(),
+            peer_names: HashMap::new(),
             default_bind: args.bind.unwrap_or(config.listen.bind_addr),
             default_peer: args.connect.or(config.peer.default_peer),
             discovery_enabled: !args.disable_discovery && config.discovery.enabled,
+            discovery_target: config.discovery.broadcast,
+            pending_listen_addr: None,
+            pending_connect_addr: None,
+            selected_peer: 0,
         }
     }
 
@@ -60,10 +73,6 @@ impl App {
                 self.should_quit = true;
                 return Some(ServiceCommand::Disconnect);
             }
-            KeyCode::Char('q') if !ctrl => {
-                self.should_quit = true;
-                return Some(ServiceCommand::Disconnect);
-            }
             KeyCode::Esc => {
                 self.mode = Mode::Chat;
                 self.input.clear();
@@ -74,26 +83,42 @@ impl App {
                 self.input.pop();
             }
             KeyCode::Char('l') if ctrl => {
-                self.mode = Mode::Listen;
+                self.mode = Mode::ListenAddress;
                 self.input = self.default_bind.to_string();
-                self.status_line = "Enter listen address".to_string();
+                self.status_line = "Enter listen address".into();
             }
             KeyCode::Char('k') if ctrl => {
-                self.mode = Mode::Connect;
+                self.mode = Mode::ConnectAddress;
                 self.input = self
                     .default_peer
                     .map(|addr| addr.to_string())
                     .unwrap_or_default();
-                self.status_line = "Enter peer address".to_string();
+                self.status_line = "Enter peer address".into();
             }
             KeyCode::Char('f') if ctrl => {
                 self.mode = Mode::File;
                 self.input.clear();
-                self.status_line = "Enter file path to send".to_string();
+                self.status_line = "Enter file path to send".into();
             }
             KeyCode::Char('d') if ctrl && self.discovery_enabled => {
-                self.status_line = "Scanning for peers...".to_string();
+                self.status_line = "Scanning for peers...".into();
                 return Some(ServiceCommand::Discover);
+            }
+            KeyCode::Char('p') if ctrl => {
+                self.shortcut_to_peer();
+            }
+            KeyCode::Char('u') if ctrl => {
+                self.mode = Mode::Username;
+                self.input = self.username.clone();
+                self.status_line = "Choose a nickname".into();
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.mode = Mode::DiscoveryNetwork;
+                self.input = self
+                    .discovery_target
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "255.255.255.255".into());
+                self.status_line = "Discovery broadcast IP (blank = auto)".into();
             }
             KeyCode::Enter => return self.commit_input(),
             KeyCode::Char(ch) => {
@@ -102,6 +127,20 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    fn shortcut_to_peer(&mut self) {
+        if self.discovered.is_empty() {
+            self.status_line = "No peers discovered yet.".into();
+            return;
+        }
+        self.selected_peer = (self.selected_peer + 1) % self.discovered.len();
+        let addr = self.discovered[self.selected_peer];
+        self.pending_connect_addr = Some(addr);
+        self.mode = Mode::ConnectPassword;
+        self.input.clear();
+        self.status_line =
+            format!("Preparing to connect to {addr}. Enter password (blank if none).");
     }
 
     fn commit_input(&mut self) -> Option<ServiceCommand> {
@@ -125,43 +164,112 @@ impl App {
                 self.mode = Mode::Chat;
                 return Some(ServiceCommand::SendFile { path });
             }
-            Mode::Listen => match self.input.trim().parse::<SocketAddr>() {
+            Mode::ListenAddress => match self.input.trim().parse::<SocketAddr>() {
                 Ok(addr) => {
-                    self.mode = Mode::Chat;
-                    self.status_line = format!("Listening on {addr}");
-                    return Some(ServiceCommand::Listen { addr });
+                    self.pending_listen_addr = Some(addr);
+                    self.mode = Mode::ListenPassword;
+                    self.input.clear();
+                    self.status_line = "Password for peers (blank = open)".into();
                 }
-                Err(_) => {
-                    self.status_line = "Invalid listen address".into();
-                }
+                Err(_) => self.status_line = "Invalid listen address".into(),
             },
-            Mode::Connect => match self.input.trim().parse::<SocketAddr>() {
+            Mode::ListenPassword => {
+                if let Some(addr) = self.pending_listen_addr.take() {
+                    let password = if self.input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.input.trim().to_string())
+                    };
+                    self.input.clear();
+                    self.mode = Mode::Chat;
+                    return Some(ServiceCommand::Listen { addr, password });
+                }
+            }
+            Mode::ConnectAddress => match self.input.trim().parse::<SocketAddr>() {
                 Ok(addr) => {
-                    self.mode = Mode::Chat;
-                    self.status_line = format!("Connecting to {addr}");
-                    return Some(ServiceCommand::Connect { addr });
+                    self.pending_connect_addr = Some(addr);
+                    self.mode = Mode::ConnectPassword;
+                    self.input.clear();
+                    self.status_line = "Peer password (blank if none)".into();
                 }
-                Err(_) => {
-                    self.status_line = "Invalid peer address".into();
-                }
+                Err(_) => self.status_line = "Invalid peer address".into(),
             },
+            Mode::ConnectPassword => {
+                if let Some(addr) = self.pending_connect_addr.take() {
+                    let password = if self.input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.input.trim().to_string())
+                    };
+                    self.input.clear();
+                    self.mode = Mode::Chat;
+                    return Some(ServiceCommand::Connect { addr, password });
+                }
+            }
+            Mode::Username => {
+                if self.input.trim().is_empty() {
+                    self.status_line = "Nickname cannot be empty".into();
+                    return None;
+                }
+                self.username = self.input.trim().to_string();
+                self.input.clear();
+                self.mode = Mode::Chat;
+                return Some(ServiceCommand::SetUsername {
+                    username: self.username.clone(),
+                });
+            }
+            Mode::DiscoveryNetwork => {
+                let trimmed = self.input.trim();
+                let target = if trimmed.is_empty() {
+                    None
+                } else {
+                    match trimmed.parse::<Ipv4Addr>() {
+                        Ok(ip) => Some(ip),
+                        Err(_) => {
+                            self.status_line = "Enter a valid IPv4, e.g. 192.168.0.255".into();
+                            return None;
+                        }
+                    }
+                };
+                self.input.clear();
+                self.mode = Mode::Chat;
+                self.discovery_target = target;
+                self.status_line = target
+                    .map(|ip| format!("Discovery bound to {ip}"))
+                    .unwrap_or_else(|| "Discovery reset to default broadcast".into());
+                return Some(ServiceCommand::SetDiscoveryTarget { target });
+            }
         }
         None
     }
 
     pub fn handle_service_event(&mut self, event: ServiceEvent) {
         match event {
-            ServiceEvent::Connected { peer } => {
-                self.connection = ConnectionStatus::Connected(peer);
-                self.push_system(format!("Connected to {peer}"));
+            ServiceEvent::Connected { peer, name } => {
+                self.peer_names.insert(peer, name.clone());
+                self.connection = ConnectionStatus::Connected {
+                    peer,
+                    name: name.clone(),
+                };
+                self.push_system(format!("Connected to {name} ({peer})"));
             }
             ServiceEvent::Connecting { peer } => {
                 self.connection = ConnectionStatus::Connecting(peer);
-                self.status_line = format!("Connecting to {peer}...");
+                self.status_line = format!("Connecting to {peer}…");
             }
-            ServiceEvent::Listening { addr } => {
-                self.connection = ConnectionStatus::Listening(addr);
-                self.push_system(format!("Listening on {addr}"));
+            ServiceEvent::Listening {
+                addr,
+                password_protected,
+            } => {
+                self.connection = ConnectionStatus::Listening {
+                    addr,
+                    locked: password_protected,
+                };
+                if password_protected {
+                    self.push_system(format!("Listening on {addr} (locked)"));
+                } else {
+                    self.push_system(format!("Listening on {addr}"));
+                }
             }
             ServiceEvent::ListenerStopped => {
                 self.connection = ConnectionStatus::Disconnected;
@@ -171,11 +279,25 @@ impl App {
                 self.connection = ConnectionStatus::Disconnected;
                 self.push_system("Disconnected");
             }
-            ServiceEvent::MessageReceived { peer, text } => {
-                self.push_message(MessageDirection::Incoming, format!("{peer}: {text}"));
+            ServiceEvent::MessageReceived { peer, author, text } => {
+                self.peer_names.insert(peer, author.clone());
+                self.push_message(MessageDirection::Incoming(author), text);
             }
-            ServiceEvent::MessageSent { text } => {
-                self.push_message(MessageDirection::Outgoing, text);
+            ServiceEvent::MessageSent { author, text } => {
+                self.username = author.clone();
+                self.push_message(MessageDirection::Outgoing(author), text);
+            }
+            ServiceEvent::PeerProfile { peer, username } => {
+                self.peer_names.insert(peer, username.clone());
+                if let ConnectionStatus::Connected { peer: current, .. } = &mut self.connection {
+                    if *current == peer {
+                        self.connection = ConnectionStatus::Connected {
+                            peer,
+                            name: username.clone(),
+                        };
+                    }
+                }
+                self.push_system(format!("{username} is now online ({peer})"));
             }
             ServiceEvent::FileTransfer(progress) => self.update_transfer(progress),
             ServiceEvent::Discovery(event) => match event {
@@ -183,14 +305,18 @@ impl App {
                     if !self.discovered.contains(&peer) {
                         self.discovered.push(peer);
                         self.discovered.sort();
+                        if self.selected_peer >= self.discovered.len() {
+                            self.selected_peer = 0;
+                        }
                     }
                     self.status_line = format!("Found peer {peer}");
                 }
                 DiscoveryEvent::Completed => {
                     if self.discovered.is_empty() {
-                        self.status_line = "No peers discovered".into();
+                        self.status_line = "No peers were found".into();
+                        self.selected_peer = 0;
                     } else {
-                        self.status_line = format!("{} peers ready", self.discovered.len());
+                        self.status_line = format!("{} peer(s) ready", self.discovered.len());
                     }
                 }
             },
@@ -224,11 +350,17 @@ impl App {
         if self.messages.len() >= MAX_MESSAGES {
             self.messages.remove(0);
         }
+        let author = direction.source().to_string();
         self.messages.push(ChatEntry {
             direction,
+            author,
             text,
             timestamp: OffsetDateTime::now_utc(),
         });
+    }
+
+    pub fn peer_alias(&self, addr: &SocketAddr) -> Option<&String> {
+        self.peer_names.get(addr)
     }
 
     fn push_system(&mut self, text: impl Into<String>) {
@@ -241,31 +373,54 @@ impl App {
 pub enum Mode {
     Chat,
     File,
-    Listen,
-    Connect,
+    ListenAddress,
+    ListenPassword,
+    ConnectAddress,
+    ConnectPassword,
+    Username,
+    DiscoveryNetwork,
 }
 
 /// Connection state summary.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ConnectionStatus {
     Disconnected,
-    Listening(SocketAddr),
+    Listening { addr: SocketAddr, locked: bool },
     Connecting(SocketAddr),
-    Connected(SocketAddr),
+    Connected { peer: SocketAddr, name: String },
 }
 
 /// Direction of a chat entry.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageDirection {
-    Incoming,
-    Outgoing,
+    Incoming(String),
+    Outgoing(String),
     System,
+}
+
+impl MessageDirection {
+    pub fn style(&self) -> Color {
+        match self {
+            MessageDirection::Incoming(_) => Color::LightCyan,
+            MessageDirection::Outgoing(_) => Color::LightGreen,
+            MessageDirection::System => Color::Gray,
+        }
+    }
+
+    fn source(&self) -> &str {
+        match self {
+            MessageDirection::Incoming(name) => name,
+            MessageDirection::Outgoing(name) => name,
+            MessageDirection::System => "system",
+        }
+    }
 }
 
 /// Entry to render in the message list.
 #[derive(Debug, Clone)]
 pub struct ChatEntry {
     pub direction: MessageDirection,
+    pub author: String,
     pub text: String,
     pub timestamp: OffsetDateTime,
 }
@@ -285,6 +440,7 @@ pub struct TransferState {
 fn parse_color(raw: &str) -> Color {
     match raw.to_ascii_lowercase().as_str() {
         "red" => Color::Red,
+        "crimson" => Color::Rgb(220, 20, 60),
         "green" => Color::Green,
         "yellow" => Color::Yellow,
         "cyan" => Color::Cyan,
@@ -314,15 +470,18 @@ mod tests {
     }
 
     #[test]
-    fn listen_mode_parses_socket() {
+    fn listen_flow_requests_password() {
         let config = AppConfig::default();
         let args = TuiCommand::default();
         let mut app = App::new(&config, &args);
-        app.mode = Mode::Listen;
-        app.input = "127.0.0.1:5000".into();
+        app.mode = Mode::ListenAddress;
+        app.input = "127.0.0.1:6000".into();
+        assert!(app.commit_input().is_none());
+        app.input = "secret".into();
+        app.mode = Mode::ListenPassword;
         assert!(matches!(
             app.commit_input(),
-            Some(ServiceCommand::Listen { addr }) if addr.port() == 5000
+            Some(ServiceCommand::Listen { addr, password }) if addr.port() == 6000 && password == Some("secret".into())
         ));
     }
 }

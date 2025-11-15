@@ -1,4 +1,6 @@
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::fs::OpenOptions;
@@ -9,7 +11,10 @@ use tokio::task::JoinHandle;
 use crate::cli::{ListenCommand, SendCommand, SendFileCommand};
 use crate::config::{AppConfig, LimitsConfig};
 use crate::net;
-use crate::protocol::{self, FileChunk, FileMetadata, TextMessage, WireMessage};
+use crate::protocol::{
+    self, ControlMessage, FileChunk, FileMetadata, HelloMessage, TextMessage, WireMessage,
+};
+use parking_lot::Mutex;
 
 const COMMAND_BUFFER: usize = 64;
 const EVENT_BUFFER: usize = 256;
@@ -51,13 +56,29 @@ impl DezapService {
 /// Commands that drive the networking service.
 #[derive(Debug)]
 pub enum ServiceCommand {
-    Listen { addr: std::net::SocketAddr },
+    Listen {
+        addr: std::net::SocketAddr,
+        password: Option<String>,
+    },
     StopListening,
-    Connect { addr: std::net::SocketAddr },
+    Connect {
+        addr: std::net::SocketAddr,
+        password: Option<String>,
+    },
     Disconnect,
-    SendText { text: String },
-    SendFile { path: PathBuf },
+    SendText {
+        text: String,
+    },
+    SendFile {
+        path: PathBuf,
+    },
     Discover,
+    SetUsername {
+        username: String,
+    },
+    SetDiscoveryTarget {
+        target: Option<Ipv4Addr>,
+    },
 }
 
 /// Events emitted by the service to inform the UI/CLI.
@@ -65,21 +86,29 @@ pub enum ServiceCommand {
 pub enum ServiceEvent {
     Connected {
         peer: std::net::SocketAddr,
+        name: String,
     },
     Connecting {
         peer: std::net::SocketAddr,
     },
     Listening {
         addr: std::net::SocketAddr,
+        password_protected: bool,
     },
     ListenerStopped,
     Disconnected,
     MessageReceived {
         peer: std::net::SocketAddr,
+        author: String,
         text: String,
     },
     MessageSent {
+        author: String,
         text: String,
+    },
+    PeerProfile {
+        peer: std::net::SocketAddr,
+        username: String,
     },
     FileTransfer(FileTransferProgress),
     Discovery(DiscoveryEvent),
@@ -149,6 +178,9 @@ struct ServiceState {
     listener: Option<ListenerState>,
     client: Option<ClientState>,
     connection: Option<ConnectionState>,
+    username: String,
+    listener_password: Option<String>,
+    discovery_override: Option<Ipv4Addr>,
 }
 
 impl ServiceState {
@@ -157,6 +189,8 @@ impl ServiceState {
         event_tx: mpsc::Sender<ServiceEvent>,
         internal_tx: mpsc::Sender<InternalSignal>,
     ) -> Self {
+        let username = config.identity.username.clone();
+        let listener_password = config.listen.password.clone();
         Self {
             config,
             event_tx,
@@ -164,25 +198,38 @@ impl ServiceState {
             listener: None,
             client: None,
             connection: None,
+            username,
+            listener_password,
+            discovery_override: None,
         }
     }
 
     async fn handle_command(&mut self, command: ServiceCommand) -> Result<()> {
         match command {
-            ServiceCommand::Listen { addr } => self.start_listener(addr).await,
+            ServiceCommand::Listen { addr, password } => self.start_listener(addr, password).await,
             ServiceCommand::StopListening => self.stop_listener().await,
-            ServiceCommand::Connect { addr } => self.connect(addr).await,
+            ServiceCommand::Connect { addr, password } => self.connect(addr, password).await,
             ServiceCommand::Disconnect => self.disconnect().await,
             ServiceCommand::SendText { text } => self.send_text(text).await,
             ServiceCommand::SendFile { path } => self.send_file(path).await,
             ServiceCommand::Discover => self.run_discovery().await,
+            ServiceCommand::SetUsername { username } => {
+                self.username = username;
+                Ok(())
+            }
+            ServiceCommand::SetDiscoveryTarget { target } => {
+                self.discovery_override = target;
+                Ok(())
+            }
         }
     }
 
     async fn handle_internal(&mut self, signal: InternalSignal) -> Result<()> {
         match signal {
             InternalSignal::Inbound(connection, peer) => {
-                self.attach_connection(connection, peer).await
+                let required = self.listener_password.clone();
+                self.attach_connection(connection, peer, None, required)
+                    .await
             }
             InternalSignal::ConnectionClosed(peer) => {
                 if let Some(state) = &self.connection {
@@ -196,13 +243,20 @@ impl ServiceState {
         }
     }
 
-    async fn start_listener(&mut self, addr: std::net::SocketAddr) -> Result<()> {
+    async fn start_listener(
+        &mut self,
+        addr: std::net::SocketAddr,
+        password: Option<String>,
+    ) -> Result<()> {
         if self.listener.is_some() {
             bail!("listener already active");
         }
 
         let server = net::bind_server(addr, &self.config.tls)?;
         let discovery = net::spawn_discovery_responder(addr, &self.config.discovery).await?;
+        self.listener_password = password
+            .clone()
+            .or_else(|| self.config.listen.password.clone());
         let endpoint = server.endpoint.clone();
         let internal = self.internal_tx.clone();
         let incoming_task = tokio::spawn(async move {
@@ -236,7 +290,10 @@ impl ServiceState {
         });
 
         self.event_tx
-            .send(ServiceEvent::Listening { addr })
+            .send(ServiceEvent::Listening {
+                addr,
+                password_protected: self.listener_password.is_some(),
+            })
             .await
             .ok();
         Ok(())
@@ -254,7 +311,11 @@ impl ServiceState {
         Ok(())
     }
 
-    async fn connect(&mut self, addr: std::net::SocketAddr) -> Result<()> {
+    async fn connect(
+        &mut self,
+        addr: std::net::SocketAddr,
+        password: Option<String>,
+    ) -> Result<()> {
         self.event_tx
             .send(ServiceEvent::Connecting { peer: addr })
             .await
@@ -264,7 +325,8 @@ impl ServiceState {
         let client = self.client_endpoint()?;
         let connection =
             net::connect(client.endpoint, &client.client_config, addr, &server_name).await?;
-        self.attach_connection(connection, addr).await
+        self.attach_connection(connection, addr, password, None)
+            .await
     }
 
     async fn disconnect(&mut self) -> Result<()> {
@@ -287,6 +349,7 @@ impl ServiceState {
             .clone();
         send_text_message(
             &connection,
+            &self.username,
             text.clone(),
             &self.config.limits,
             &self.event_tx,
@@ -294,7 +357,7 @@ impl ServiceState {
         .await?;
         persist_chat(
             self.config.paths.chat_log.clone(),
-            format!("outgoing: {}", text),
+            format!("{} (you): {}", self.username, text),
         )
         .await?;
         Ok(())
@@ -311,7 +374,7 @@ impl ServiceState {
     }
 
     async fn run_discovery(&mut self) -> Result<()> {
-        let peers = net::discover_peers(&self.config.discovery).await?;
+        let peers = net::discover_peers(&self.config.discovery, self.discovery_override).await?;
         if peers.is_empty() {
             self.event_tx
                 .send(ServiceEvent::Discovery(DiscoveryEvent::Completed))
@@ -336,6 +399,8 @@ impl ServiceState {
         &mut self,
         connection: quinn::Connection,
         peer: std::net::SocketAddr,
+        outgoing_password: Option<String>,
+        required_password: Option<String>,
     ) -> Result<()> {
         self.disconnect().await?;
         let download_dir = self.config.paths.download_dir.clone();
@@ -344,6 +409,11 @@ impl ServiceState {
         let chat_log = self.config.paths.chat_log.clone();
         let internal = self.internal_tx.clone();
         let reader_connection = connection.clone();
+        let meta = ConnectionMeta::new("???");
+        let auth = AuthContext {
+            required_password: required_password.clone(),
+            meta: meta.clone(),
+        };
         let reader = tokio::spawn(async move {
             if let Err(err) = read_connection(
                 reader_connection,
@@ -351,6 +421,7 @@ impl ServiceState {
                 limits,
                 chat_log,
                 event_tx.clone(),
+                auth,
             )
             .await
             {
@@ -369,7 +440,13 @@ impl ServiceState {
             reader,
         });
         self.event_tx
-            .send(ServiceEvent::Connected { peer })
+            .send(ServiceEvent::Connected {
+                peer,
+                name: meta.name(),
+            })
+            .await
+            .ok();
+        send_hello(&connection, &self.username, outgoing_password)
             .await
             .ok();
         Ok(())
@@ -432,11 +509,46 @@ enum InternalSignal {
     ConnectionClosed(std::net::SocketAddr),
 }
 
+#[derive(Clone)]
+struct ConnectionMeta {
+    name: Arc<Mutex<String>>,
+}
+
+impl ConnectionMeta {
+    fn new(initial: &str) -> Self {
+        Self {
+            name: Arc::new(Mutex::new(initial.to_string())),
+        }
+    }
+
+    fn set_name(&self, value: &str) {
+        *self.name.lock() = value.to_string();
+    }
+
+    fn name(&self) -> String {
+        self.name.lock().clone()
+    }
+}
+
+#[derive(Clone)]
+struct AuthContext {
+    required_password: Option<String>,
+    meta: ConnectionMeta,
+}
+
 /// Runs a headless listener in CLI mode.
 pub async fn run_listener(config: &AppConfig, cmd: ListenCommand) -> Result<()> {
     let addr = cmd.bind.unwrap_or(config.listen.bind_addr);
     let mut service = DezapService::new(config.clone());
-    service.send(ServiceCommand::Listen { addr }).await?;
+    service
+        .send(ServiceCommand::Listen {
+            addr,
+            password: cmd
+                .password
+                .clone()
+                .or_else(|| config.listen.password.clone()),
+        })
+        .await?;
 
     tracing::info!(%addr, "listener ready");
     loop {
@@ -470,6 +582,7 @@ pub async fn run_cli_message(config: &AppConfig, cmd: SendCommand) -> Result<()>
     .await?;
     send_text_message(
         &connection,
+        &config.identity.username,
         cmd.text.clone(),
         &config.limits,
         &noop_event_tx(),
@@ -479,7 +592,10 @@ pub async fn run_cli_message(config: &AppConfig, cmd: SendCommand) -> Result<()>
     ctx.endpoint.wait_idle().await;
     persist_chat(
         config.paths.chat_log.clone(),
-        format!("cli -> {}: {}", cmd.to, cmd.text),
+        format!(
+            "{} (cli) -> {}: {}",
+            config.identity.username, cmd.to, cmd.text
+        ),
     )
     .await
     .ok();
@@ -521,6 +637,7 @@ fn noop_event_tx() -> mpsc::Sender<ServiceEvent> {
 
 async fn send_text_message(
     connection: &quinn::Connection,
+    author: &str,
     text: String,
     limits: &LimitsConfig,
     event_tx: &mpsc::Sender<ServiceEvent>,
@@ -538,6 +655,7 @@ async fn send_text_message(
         .context("failed opening unidirectional stream")?;
     let payload = WireMessage::Text(TextMessage {
         id: rand::random(),
+        author: author.to_string(),
         body: trimmed.to_string(),
         timestamp: protocol::utc_timestamp(),
     });
@@ -545,10 +663,42 @@ async fn send_text_message(
     let _ = stream.finish();
     event_tx
         .send(ServiceEvent::MessageSent {
+            author: author.to_string(),
             text: trimmed.to_string(),
         })
         .await
         .ok();
+    Ok(())
+}
+
+async fn send_hello(
+    connection: &quinn::Connection,
+    username: &str,
+    password: Option<String>,
+) -> Result<()> {
+    let mut stream = connection
+        .open_uni()
+        .await
+        .context("failed to open control stream")?;
+    let message = WireMessage::Control(ControlMessage::Hello(HelloMessage {
+        username: username.to_string(),
+        password,
+    }));
+    protocol::write_message(&mut stream, &message).await?;
+    let _ = stream.finish();
+    Ok(())
+}
+
+async fn send_control_message(
+    connection: &quinn::Connection,
+    message: ControlMessage,
+) -> Result<()> {
+    let mut stream = connection
+        .open_uni()
+        .await
+        .context("failed to open control stream")?;
+    protocol::write_message(&mut stream, &WireMessage::Control(message)).await?;
+    let _ = stream.finish();
     Ok(())
 }
 
@@ -628,6 +778,7 @@ async fn read_connection(
     limits: LimitsConfig,
     chat_log: Option<PathBuf>,
     event_tx: mpsc::Sender<ServiceEvent>,
+    auth: AuthContext,
 ) -> Result<()> {
     let peer = connection.remote_address();
     loop {
@@ -642,8 +793,10 @@ async fn read_connection(
                     let limits = limits.clone();
                     let tx = event_tx.clone();
                     let log = chat_log.clone();
+                    let conn = connection.clone();
+                    let auth_ctx = auth.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_stream(recv, dir, limits, log, tx, peer).await {
+                        if let Err(err) = handle_stream(recv, dir, limits, log, tx, peer, conn, auth_ctx).await {
                             tracing::warn!(?peer, "stream error: {err:#}");
                         }
                     });
@@ -659,8 +812,10 @@ async fn read_connection(
                     let limits = limits.clone();
                     let tx = event_tx.clone();
                     let log = chat_log.clone();
+                    let conn = connection.clone();
+                    let auth_ctx = auth.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_stream(recv, dir, limits, log, tx, peer).await {
+                        if let Err(err) = handle_stream(recv, dir, limits, log, tx, peer, conn, auth_ctx).await {
                             tracing::warn!(?peer, "bi stream error: {err:#}");
                         }
                     });
@@ -682,19 +837,22 @@ async fn handle_stream(
     chat_log: Option<PathBuf>,
     event_tx: mpsc::Sender<ServiceEvent>,
     peer: std::net::SocketAddr,
+    connection: quinn::Connection,
+    auth: AuthContext,
 ) -> Result<()> {
     match protocol::read_message(&mut recv).await? {
         Some(WireMessage::Text(text)) => {
             event_tx
                 .send(ServiceEvent::MessageReceived {
                     peer,
+                    author: text.author.clone(),
                     text: text.body.clone(),
                 })
                 .await
                 .ok();
             persist_chat(
                 chat_log.clone(),
-                format!("incoming from {peer}: {}", text.body),
+                format!("{} -> you: {}", text.author, text.body),
             )
             .await
             .ok();
@@ -702,10 +860,63 @@ async fn handle_stream(
         Some(WireMessage::FileMeta(meta)) => {
             receive_file_stream(recv, meta, download_dir, limits, event_tx, peer).await?;
         }
+        Some(WireMessage::Control(control)) => {
+            handle_control(control, connection, auth, event_tx.clone(), peer).await?;
+        }
         Some(other) => {
             tracing::debug!(?other, "unexpected first frame");
         }
         None => {}
+    }
+    Ok(())
+}
+
+async fn handle_control(
+    control: ControlMessage,
+    connection: quinn::Connection,
+    auth: AuthContext,
+    event_tx: mpsc::Sender<ServiceEvent>,
+    peer: std::net::SocketAddr,
+) -> Result<()> {
+    match control {
+        ControlMessage::Hello(hello) => {
+            if let Some(required) = &auth.required_password {
+                if hello.password.as_deref() != Some(required) {
+                    let _ = send_control_message(
+                        &connection,
+                        ControlMessage::Denied("Senha incorreta".into()),
+                    )
+                    .await;
+                    connection.close(0u32.into(), b"invalid password");
+                    bail!("peer {peer} failed password validation");
+                }
+            }
+            auth.meta.set_name(&hello.username);
+            event_tx
+                .send(ServiceEvent::PeerProfile {
+                    peer,
+                    username: hello.username,
+                })
+                .await
+                .ok();
+        }
+        ControlMessage::Denied(reason) => {
+            event_tx
+                .send(ServiceEvent::Error {
+                    message: format!("conexão recusada por {peer}: {reason}"),
+                })
+                .await
+                .ok();
+            connection.close(0u32.into(), b"remote denied");
+        }
+        ControlMessage::Info(info) => {
+            event_tx
+                .send(ServiceEvent::Error {
+                    message: format!("mensagem de {peer}: {info}"),
+                })
+                .await
+                .ok();
+        }
     }
     Ok(())
 }

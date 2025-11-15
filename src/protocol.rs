@@ -21,6 +21,7 @@ pub enum WireMessage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TextMessage {
     pub id: u64,
+    pub author: String,
     pub body: String,
     pub timestamp: i64,
 }
@@ -58,8 +59,17 @@ pub enum AckKind {
 
 /// Control messages for future extensions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ControlMessage {
-    pub note: String,
+pub enum ControlMessage {
+    Hello(HelloMessage),
+    Denied(String),
+    Info(String),
+}
+
+/// Hello handshake contents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HelloMessage {
+    pub username: String,
+    pub password: Option<String>,
 }
 
 /// Serializes a [`WireMessage`] into bytes.
@@ -143,6 +153,7 @@ mod tests {
     async fn frame_round_trip() {
         let message = WireMessage::Text(TextMessage {
             id: 42,
+            author: "tester".into(),
             body: "hello".into(),
             timestamp: utc_timestamp(),
         });

@@ -125,7 +125,10 @@ pub async fn spawn_discovery_responder(
 }
 
 /// Broadcast-based peer discovery helper.
-pub async fn discover_peers(discovery: &DiscoveryConfig) -> Result<Vec<SocketAddr>> {
+pub async fn discover_peers(
+    discovery: &DiscoveryConfig,
+    override_broadcast: Option<Ipv4Addr>,
+) -> Result<Vec<SocketAddr>> {
     if !discovery.enabled {
         return Ok(Vec::new());
     }
@@ -137,7 +140,10 @@ pub async fn discover_peers(discovery: &DiscoveryConfig) -> Result<Vec<SocketAdd
         .set_broadcast(true)
         .context("failed to enable UDP broadcast")?;
 
-    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::BROADCAST), discovery.port);
+    let broadcast_ip = override_broadcast
+        .or(discovery.broadcast)
+        .unwrap_or(Ipv4Addr::BROADCAST);
+    let target = SocketAddr::new(IpAddr::V4(broadcast_ip), discovery.port);
     socket
         .send_to(discovery.magic.as_bytes(), target)
         .await

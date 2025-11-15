@@ -84,6 +84,10 @@ pub struct ListenCommand {
     /// Address to bind to (overrides configuration).
     #[arg(long)]
     pub bind: Option<SocketAddr>,
+
+    /// Optional password required for peers to connect.
+    #[arg(long)]
+    pub password: Option<String>,
 }
 
 /// Single-message send options.

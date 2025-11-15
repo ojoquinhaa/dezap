@@ -31,11 +31,20 @@ pub async fn run(mut service: DezapService, config: AppConfig, args: TuiCommand)
     let mut events = EventStream::new()?;
 
     if let Some(addr) = args.bind {
-        service.send(ServiceCommand::Listen { addr }).await.ok();
+        service
+            .send(ServiceCommand::Listen {
+                addr,
+                password: None,
+            })
+            .await
+            .ok();
     }
     if let Some(peer) = args.connect.or(config.peer.default_peer) {
         service
-            .send(ServiceCommand::Connect { addr: peer })
+            .send(ServiceCommand::Connect {
+                addr: peer,
+                password: None,
+            })
             .await
             .ok();
     }

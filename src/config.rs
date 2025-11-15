@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub listen: ListenConfig,
     pub peer: PeerConfig,
+    pub identity: IdentityConfig,
     pub paths: PathsConfig,
     pub limits: LimitsConfig,
     pub tls: TlsConfig,
@@ -26,6 +27,7 @@ impl Default for AppConfig {
         Self {
             listen: ListenConfig::default(),
             peer: PeerConfig::default(),
+            identity: IdentityConfig::default(),
             paths: PathsConfig::default(),
             limits: LimitsConfig::default(),
             tls: TlsConfig::default(),
@@ -73,12 +75,14 @@ impl AppConfig {
 #[serde(default)]
 pub struct ListenConfig {
     pub bind_addr: SocketAddr,
+    pub password: Option<String>,
 }
 
 impl Default for ListenConfig {
     fn default() -> Self {
         Self {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5000),
+            password: None,
         }
     }
 }
@@ -93,6 +97,21 @@ pub struct PeerConfig {
 impl Default for PeerConfig {
     fn default() -> Self {
         Self { default_peer: None }
+    }
+}
+
+/// Local identity preferences.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IdentityConfig {
+    pub username: String,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            username: "dezapster".to_string(),
+        }
     }
 }
 
@@ -201,7 +220,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             show_timestamps: true,
-            accent: "magenta".to_string(),
+            accent: "crimson".to_string(),
         }
     }
 }
@@ -235,6 +254,7 @@ pub struct DiscoveryConfig {
     pub port: u16,
     pub response_ttl_ms: u64,
     pub magic: String,
+    pub broadcast: Option<Ipv4Addr>,
 }
 
 impl Default for DiscoveryConfig {
@@ -244,6 +264,7 @@ impl Default for DiscoveryConfig {
             port: 54095,
             response_ttl_ms: 2_000,
             magic: "dezap-discovery".to_string(),
+            broadcast: None,
         }
     }
 }
