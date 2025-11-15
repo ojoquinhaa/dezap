@@ -15,6 +15,7 @@ pub enum WireMessage {
     FileChunk(FileChunk),
     Ack(Ack),
     Control(ControlMessage),
+    Ciphertext(CipherFrame),
 }
 
 /// Text chat payload.
@@ -31,7 +32,8 @@ pub struct TextMessage {
 pub struct FileMetadata {
     pub id: u64,
     pub name: String,
-    pub size: u64,
+    pub compressed_size: u64,
+    pub original_size: u64,
 }
 
 /// File chunk message.
@@ -63,6 +65,9 @@ pub enum ControlMessage {
     Hello(HelloMessage),
     Denied(String),
     Info(String),
+    FileOffer(FileOffer),
+    FileAccept(FileAccept),
+    FileReject(FileReject),
 }
 
 /// Hello handshake contents.
@@ -70,6 +75,36 @@ pub enum ControlMessage {
 pub struct HelloMessage {
     pub username: String,
     pub password: Option<String>,
+    pub public_key: [u8; 32],
+}
+
+/// File offer handshake.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileOffer {
+    pub id: u64,
+    pub name: String,
+    pub original_size: u64,
+    pub compressed_size: u64,
+}
+
+/// Acceptance of a pending file transfer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileAccept {
+    pub id: u64,
+}
+
+/// Rejection of a pending file transfer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileReject {
+    pub id: u64,
+    pub reason: Option<String>,
+}
+
+/// Encrypted payload envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CipherFrame {
+    pub nonce: [u8; 12],
+    pub body: Vec<u8>,
 }
 
 /// Serializes a [`WireMessage`] into bytes.
@@ -170,7 +205,8 @@ mod tests {
         let meta = WireMessage::FileMeta(FileMetadata {
             id: 7,
             name: "file.bin".into(),
-            size: 128,
+            compressed_size: 96,
+            original_size: 128,
         });
 
         let bytes = encode_message(&meta).unwrap();

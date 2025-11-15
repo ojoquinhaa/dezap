@@ -1,6 +1,74 @@
 # dezap
 
-Dezap is a retro-flavored, LAN-first peer-to-peer messenger and file transfer tool. It couples a colorful TUI with a CLI so you can chat or automate workflows entirely over QUIC.
+Dezap is a secure, LAN-only peer-to-peer messenger with a retro-styled terminal interface and headless CLI. It uses QUIC for all traffic, compresses files before transport, and stores encrypted chat history alongside saved peer metadata for long-term auditability.
+
+## Highlights
+
+- End-to-end encrypted chat over QUIC with ChaCha20-Poly1305 wrapping and live status updates.
+- Interactive TUI built on `ratatui` with ASCII art header, configurable accent colors, chat browsing, clipboard copy, and file autocompletion.
+- Dual-mode CLI (`tui`, `listen`, `send`, `send-file`) plus persistent config, discovery filtering, and logging hooks.
+- File transfers compress before sending, offer dialogs on the recipient, and stream progress via `ServiceEvent::FileTransfer`.
+- History files are gzip-compressed, encrypted, and stored per peer; saved peer metadata is maintained in `peers.json`.
+
+## Getting Started
+
+```bash
+cargo build
+cargo run      # launches the TUI (same as `cargo run -- tui`)
+```
+
+The TUI default keybindings:
+
+| Binding        | Description                                  |
+|----------------|----------------------------------------------|
+| `Enter`        | Send message / confirm dialogs                |
+| `Ctrl+K`       | Connect to peer                              |
+| `Ctrl+L`       | Start listener                               |
+| `Ctrl+F`       | Send file (with Tab-based autocomplete)       |
+| `Ctrl+D`       | Discover peers                               |
+| `Ctrl+G`       | Browse chat history (`↑`/`↓`, `c` copies)     |
+| `Ctrl+X`       | Disconnect current peer                      |
+| `Esc`          | Close dialog (or decline incoming file)       |
+| `Tab`          | Toggle help or autocomplete (contextual)      |
+
+Incoming file offers pre-fill the download directory; edit the path, press `Enter` to save, or `Esc` to decline. Queued offers display status messages in the help window.
+
+## CLI Usage
+
+```
+dezap tui [--bind <addr>] [--connect <peer>]
+dezap listen --bind <addr> [--password <secret>]
+dezap send --to <peer> --text "hello"
+dezap send-file --to <peer> --path ./archive.zip
+```
+
+Use `--config` to point to a custom `config.toml`, `-v/--verbose` to change logging, and `--disable-discovery` when broadcasts are not allowed.
+
+## Configuration
+
+Dezap merges defaults, `$XDG_CONFIG_HOME/dezap/config.toml`, CLI overrides, and `DEZAP__` environment variables. `docs/configuration.md` describes all sections (`listen`, `identity`, `paths`, `limits`, `tls`, `ui`, `discovery`).
+
+## Documentation
+
+- `docs/overview.md`: high-level goals and runtime flow.
+- `docs/architecture.md`: crate layout and service responsibilities.
+- `docs/network.md`: QUIC framing, control messages, and encryption.
+- `docs/tui.md`: interface layout, navigation, and shortcuts.
+- `docs/cli.md`: CLI verbs and flags.
+- `docs/configuration.md`: config structure.
+- `docs/security.md`: TLS, encryption, persistence, and file transfer details.
+
+## Testing
+
+```bash
+cargo test
+```
+
+The repo includes unit tests for the protocol and TUI state; integration/network tests are marked `ignore` due to socket permissions.
+
+## Licensing & Contributions
+
+Contributions are welcome. Please follow the code style already established, keep encrypted artifacts out of git (`history.key`, TLS material), and document new behaviors that affect the TUI or networking in `docs/`.
 
 ## Features
 

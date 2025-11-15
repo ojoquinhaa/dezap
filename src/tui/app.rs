@@ -1,7 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use arboard::Clipboard;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Color;
 use time::OffsetDateTime;
@@ -9,7 +11,8 @@ use time::OffsetDateTime;
 use crate::cli::TuiCommand;
 use crate::config::AppConfig;
 use crate::service::{
-    DiscoveryEvent, FileTransferProgress, ServiceCommand, ServiceEvent, TransferDirection,
+    DiscoveryEvent, FileOfferNotice, FileTransferProgress, SavedPeer, ServiceCommand, ServiceEvent,
+    TransferDirection,
 };
 
 const MAX_MESSAGES: usize = 512;
@@ -32,9 +35,15 @@ pub struct App {
     default_peer: Option<SocketAddr>,
     pub discovery_enabled: bool,
     pub discovery_target: Option<Ipv4Addr>,
+    pub saved_peers: Vec<SavedPeer>,
     pending_listen_addr: Option<SocketAddr>,
     pending_connect_addr: Option<SocketAddr>,
     selected_peer: usize,
+    pub chat_focus: bool,
+    pub selected_message: Option<usize>,
+    download_dir: PathBuf,
+    offer_queue: VecDeque<FileOfferNotice>,
+    active_offer: Option<FileOfferNotice>,
 }
 
 impl App {
@@ -56,9 +65,15 @@ impl App {
             default_peer: args.connect.or(config.peer.default_peer),
             discovery_enabled: !args.disable_discovery && config.discovery.enabled,
             discovery_target: config.discovery.broadcast,
+            saved_peers: Vec::new(),
             pending_listen_addr: None,
             pending_connect_addr: None,
             selected_peer: 0,
+            chat_focus: false,
+            selected_message: None,
+            download_dir: config.paths.download_dir.clone(),
+            offer_queue: VecDeque::new(),
+            active_offer: None,
         }
     }
 
@@ -68,17 +83,66 @@ impl App {
         }
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if self.chat_focus {
+            match key.code {
+                KeyCode::Esc => {
+                    self.leave_chat_focus();
+                    return None;
+                }
+                KeyCode::Enter => {
+                    self.leave_chat_focus();
+                    return None;
+                }
+                KeyCode::Up => {
+                    self.move_selection(-1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.move_selection(1);
+                    return None;
+                }
+                KeyCode::Char(ch) if !ctrl && ch.eq_ignore_ascii_case(&'c') => {
+                    self.copy_selected_message();
+                    return None;
+                }
+                _ => {}
+            }
+            if key.modifiers.is_empty() {
+                return None;
+            }
+        }
+
         match key.code {
             KeyCode::Char('c') if ctrl => {
                 self.should_quit = true;
                 return Some(ServiceCommand::Disconnect);
             }
             KeyCode::Esc => {
+                if let Mode::IncomingFile(id) = self.mode {
+                    let label = self
+                        .active_offer
+                        .as_ref()
+                        .map(|offer| offer.name.clone())
+                        .unwrap_or_else(|| "file".into());
+                    self.status_line = format!("Declined '{}'", label);
+                    self.mark_offer_handled();
+                    return Some(ServiceCommand::DeclineFile { id });
+                }
                 self.mode = Mode::Chat;
-                self.input.clear();
+                if !self.chat_focus {
+                    self.input.clear();
+                }
                 self.status_line.clear();
+                self.leave_chat_focus();
             }
-            KeyCode::Tab => self.show_help = !self.show_help,
+            KeyCode::Tab => {
+                if self.mode == Mode::File {
+                    self.autocomplete_path();
+                } else {
+                    self.show_help = !self.show_help;
+                }
+            }
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -103,6 +167,14 @@ impl App {
             KeyCode::Char('d') if ctrl && self.discovery_enabled => {
                 self.status_line = "Scanning for peers...".into();
                 return Some(ServiceCommand::Discover);
+            }
+            KeyCode::Char('g') if ctrl => {
+                self.toggle_chat_focus();
+                return None;
+            }
+            KeyCode::Char('x') if ctrl => {
+                self.status_line = "Disconnecting…".into();
+                return Some(ServiceCommand::Disconnect);
             }
             KeyCode::Char('p') if ctrl => {
                 self.shortcut_to_peer();
@@ -141,6 +213,234 @@ impl App {
         self.input.clear();
         self.status_line =
             format!("Preparing to connect to {addr}. Enter password (blank if none).");
+    }
+
+    fn toggle_chat_focus(&mut self) {
+        if self.chat_focus {
+            self.leave_chat_focus();
+        } else {
+            self.enter_chat_focus();
+        }
+    }
+
+    fn enter_chat_focus(&mut self) {
+        if self.messages.is_empty() {
+            self.chat_focus = false;
+            self.selected_message = None;
+            self.status_line = "No conversations yet.".into();
+            return;
+        }
+        self.chat_focus = true;
+        if self
+            .selected_message
+            .map(|idx| idx >= self.messages.len())
+            .unwrap_or(true)
+        {
+            self.selected_message = Some(self.messages.len().saturating_sub(1));
+        }
+        self.status_line = "Browsing chat • use ↑/↓ to navigate, 'c' to copy, Esc to exit.".into();
+    }
+
+    fn leave_chat_focus(&mut self) {
+        self.chat_focus = false;
+        self.selected_message = None;
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.messages.is_empty() {
+            self.selected_message = None;
+            self.chat_focus = false;
+            return;
+        }
+        let len = self.messages.len() as isize;
+        let current = self
+            .selected_message
+            .map(|idx| idx as isize)
+            .unwrap_or(len.saturating_sub(1));
+        let mut next = current.saturating_add(delta);
+        if next < 0 {
+            next = 0;
+        }
+        if next >= len {
+            next = len - 1;
+        }
+        self.selected_message = Some(next as usize);
+    }
+
+    fn copy_selected_message(&mut self) {
+        if !self.chat_focus {
+            self.status_line = "Press Ctrl+G to browse chat first.".into();
+            return;
+        }
+        let idx = match self.selected_message {
+            Some(idx) => idx,
+            None => {
+                self.status_line = "No message selected.".into();
+                return;
+            }
+        };
+        let Some(entry) = self.messages.get(idx) else {
+            self.status_line = "Selected message is unavailable.".into();
+            return;
+        };
+        let stamp = entry
+            .timestamp
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| entry.timestamp.unix_timestamp().to_string());
+        let payload = format!("{stamp} {}: {}", entry.author, entry.text);
+        match Clipboard::new().and_then(|mut clip| clip.set_text(payload)) {
+            Ok(_) => {
+                self.status_line = format!("Copied message from {}", entry.author);
+            }
+            Err(err) => {
+                self.status_line = format!("Clipboard error: {err}");
+            }
+        }
+    }
+
+    fn enqueue_offer(&mut self, offer: FileOfferNotice) {
+        if self.active_offer.is_none() {
+            self.activate_offer(offer);
+        } else {
+            self.offer_queue.push_back(offer);
+            self.status_line = format!("Queued {} pending transfer(s)", self.offer_queue.len());
+        }
+    }
+
+    fn activate_offer(&mut self, offer: FileOfferNotice) {
+        let suggested = self.download_dir.join(&offer.name);
+        self.input = suggested.to_string_lossy().to_string();
+        self.mode = Mode::IncomingFile(offer.id);
+        self.active_offer = Some(offer.clone());
+        self.status_line = format!(
+            "Incoming '{}' from {} ({}). Edit path & Enter to accept, Esc to decline.",
+            offer.name,
+            offer.peer,
+            human_size(offer.original_size)
+        );
+    }
+
+    fn mark_offer_handled(&mut self) {
+        self.active_offer = None;
+        self.input.clear();
+        self.mode = Mode::Chat;
+        if let Some(next) = self.offer_queue.pop_front() {
+            self.activate_offer(next);
+        }
+    }
+
+    fn autocomplete_path(&mut self) {
+        let raw = self.input.trim();
+        let sep = std::path::MAIN_SEPARATOR;
+        let (dir, prefix) = self.split_path_for_completion(raw);
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) => {
+                self.status_line = format!("Cannot read {}: {err}", dir.display());
+                return;
+            }
+        };
+        let mut matches: Vec<(String, bool)> = Vec::new();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !prefix.is_empty() && !name.starts_with(&prefix) {
+                continue;
+            }
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            matches.push((name, is_dir));
+        }
+        if matches.is_empty() {
+            self.status_line = format!("No entries matching '{}' in {}", prefix, dir.display());
+            return;
+        }
+        matches.sort_by(|a, b| a.0.cmp(&b.0));
+        let base = if dir == Path::new(".") {
+            PathBuf::new()
+        } else {
+            dir.clone()
+        };
+        if matches.len() == 1 {
+            let (name, is_dir) = &matches[0];
+            let candidate = if base.as_os_str().is_empty() {
+                PathBuf::from(name)
+            } else {
+                base.join(name)
+            };
+            let mut rendered = candidate.to_string_lossy().to_string();
+            if *is_dir && !rendered.ends_with(sep) {
+                rendered.push(sep);
+            }
+            self.input = rendered;
+            self.status_line = if *is_dir {
+                format!("Completed directory {}", name)
+            } else {
+                format!("Selected file {}", name)
+            };
+            return;
+        }
+
+        let lcp = longest_common_prefix(
+            &matches
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        );
+        if lcp.len() > prefix.len() {
+            let candidate = if base.as_os_str().is_empty() {
+                PathBuf::from(&lcp)
+            } else {
+                base.join(&lcp)
+            };
+            let rendered = candidate.to_string_lossy().to_string();
+            self.input = rendered;
+        }
+        let preview = matches
+            .iter()
+            .take(6)
+            .map(|(name, is_dir)| {
+                if *is_dir {
+                    format!("{name}/")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status_line = format!(
+            "Options: {preview}{}",
+            if matches.len() > 6 { " …" } else { "" }
+        );
+    }
+
+    fn split_path_for_completion(&self, raw: &str) -> (PathBuf, String) {
+        if raw.is_empty() {
+            return (PathBuf::from("."), String::new());
+        }
+        let sep = std::path::MAIN_SEPARATOR;
+        let hint_dir = raw.ends_with(sep);
+        let path = PathBuf::from(raw);
+        if hint_dir {
+            return (path, String::new());
+        }
+        if path.is_dir() {
+            return (path, String::new());
+        }
+        let prefix = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("")
+            .to_string();
+        let parent = path
+            .parent()
+            .map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        (parent, prefix)
     }
 
     fn commit_input(&mut self) -> Option<ServiceCommand> {
@@ -239,6 +539,19 @@ impl App {
                     .unwrap_or_else(|| "Discovery reset to default broadcast".into());
                 return Some(ServiceCommand::SetDiscoveryTarget { target });
             }
+            Mode::IncomingFile(id) => {
+                let trimmed = self.input.trim();
+                if trimmed.is_empty() {
+                    self.status_line = "Choose a path to save the file".into();
+                    return None;
+                }
+                let path = PathBuf::from(trimmed);
+                self.input.clear();
+                self.mode = Mode::Chat;
+                self.status_line = "Preparing to receive file…".into();
+                self.mark_offer_handled();
+                return Some(ServiceCommand::AcceptFile { id, path });
+            }
         }
         None
     }
@@ -320,9 +633,21 @@ impl App {
                     }
                 }
             },
+            ServiceEvent::SavedPeers(list) => {
+                self.saved_peers = list;
+            }
+            ServiceEvent::FileOffer(offer) => {
+                self.push_system(format!(
+                    "Incoming file '{}' ({}) from {}",
+                    offer.name,
+                    human_size(offer.original_size),
+                    offer.peer
+                ));
+                self.enqueue_offer(offer);
+            }
             ServiceEvent::Error { message } => {
-                self.push_system(format!("Error: {message}"));
-                self.status_line = message;
+                self.push_error(message.clone());
+                self.status_line = format!("Error: {message}");
             }
         }
     }
@@ -349,6 +674,13 @@ impl App {
     fn push_message(&mut self, direction: MessageDirection, text: String) {
         if self.messages.len() >= MAX_MESSAGES {
             self.messages.remove(0);
+            if let Some(idx) = self.selected_message {
+                if idx == 0 {
+                    self.selected_message = None;
+                } else {
+                    self.selected_message = Some(idx - 1);
+                }
+            }
         }
         let author = direction.source().to_string();
         self.messages.push(ChatEntry {
@@ -357,14 +689,35 @@ impl App {
             text,
             timestamp: OffsetDateTime::now_utc(),
         });
+        self.clamp_selection();
     }
 
     pub fn peer_alias(&self, addr: &SocketAddr) -> Option<&String> {
         self.peer_names.get(addr)
     }
 
+    pub fn bind_address(&self) -> SocketAddr {
+        self.default_bind
+    }
+
     fn push_system(&mut self, text: impl Into<String>) {
         self.push_message(MessageDirection::System, text.into());
+    }
+
+    fn push_error(&mut self, text: impl Into<String>) {
+        self.push_message(MessageDirection::Error, text.into());
+    }
+
+    fn clamp_selection(&mut self) {
+        if self.messages.is_empty() {
+            self.selected_message = None;
+            return;
+        }
+        if let Some(idx) = self.selected_message {
+            if idx >= self.messages.len() {
+                self.selected_message = Some(self.messages.len().saturating_sub(1));
+            }
+        }
     }
 }
 
@@ -379,6 +732,7 @@ pub enum Mode {
     ConnectPassword,
     Username,
     DiscoveryNetwork,
+    IncomingFile(u64),
 }
 
 /// Connection state summary.
@@ -396,6 +750,7 @@ pub enum MessageDirection {
     Incoming(String),
     Outgoing(String),
     System,
+    Error,
 }
 
 impl MessageDirection {
@@ -404,6 +759,7 @@ impl MessageDirection {
             MessageDirection::Incoming(_) => Color::LightCyan,
             MessageDirection::Outgoing(_) => Color::LightGreen,
             MessageDirection::System => Color::Gray,
+            MessageDirection::Error => Color::LightRed,
         }
     }
 
@@ -412,6 +768,7 @@ impl MessageDirection {
             MessageDirection::Incoming(name) => name,
             MessageDirection::Outgoing(name) => name,
             MessageDirection::System => "system",
+            MessageDirection::Error => "error",
         }
     }
 }
@@ -447,6 +804,37 @@ fn parse_color(raw: &str) -> Color {
         "blue" => Color::Blue,
         "white" => Color::White,
         _ => Color::Magenta,
+    }
+}
+
+fn longest_common_prefix(strings: &[String]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let mut prefix = strings[0].clone();
+    for item in strings.iter().skip(1) {
+        while !item.starts_with(&prefix) {
+            if prefix.is_empty() {
+                return prefix;
+            }
+            prefix.pop();
+        }
+    }
+    prefix
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes == 0 {
+        return "0 B".into();
+    }
+    let exp = (bytes as f64).log(1024.0).floor() as usize;
+    let idx = exp.min(UNITS.len() - 1);
+    let value = bytes as f64 / 1024f64.powi(idx as i32);
+    if idx == 0 {
+        format!("{bytes} {}", UNITS[idx])
+    } else {
+        format!("{value:.1} {}", UNITS[idx])
     }
 }
 

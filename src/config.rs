@@ -121,6 +121,8 @@ impl Default for IdentityConfig {
 pub struct PathsConfig {
     pub download_dir: PathBuf,
     pub chat_log: Option<PathBuf>,
+    pub history_dir: PathBuf,
+    pub peers_file: PathBuf,
 }
 
 impl PathsConfig {
@@ -140,6 +142,19 @@ impl PathsConfig {
                 self.download_dir.display()
             )
         })?;
+        self.history_dir = Self::expand_path(&self.history_dir);
+        fs::create_dir_all(&self.history_dir).with_context(|| {
+            format!(
+                "failed to create history directory {}",
+                self.history_dir.display()
+            )
+        })?;
+        self.peers_file = Self::expand_path(&self.peers_file);
+        if let Some(parent) = self.peers_file.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create peers file directory {}", parent.display())
+            })?;
+        }
         Ok(())
     }
 
@@ -153,11 +168,21 @@ impl Default for PathsConfig {
         let download = ProjectDirs::from("io", "dezap", "Dezap")
             .map(|dirs| dirs.data_dir().join("downloads"))
             .unwrap_or_else(|| PathBuf::from("./downloads"));
-        let chat_log =
-            ProjectDirs::from("io", "dezap", "Dezap").map(|dirs| dirs.data_dir().join("chat.log"));
+        let base = ProjectDirs::from("io", "dezap", "Dezap");
+        let chat_log = base.as_ref().map(|dirs| dirs.data_dir().join("chat.log"));
+        let history_dir = base
+            .as_ref()
+            .map(|dirs| dirs.data_dir().join("history"))
+            .unwrap_or_else(|| PathBuf::from("./history"));
+        let peers_file = base
+            .as_ref()
+            .map(|dirs| dirs.config_dir().join("peers.json"))
+            .unwrap_or_else(|| PathBuf::from("./peers.json"));
         Self {
             download_dir: download,
             chat_log,
+            history_dir,
+            peers_file,
         }
     }
 }

@@ -8,7 +8,7 @@ description = "Retro-styled QUIC-based LAN messenger with TUI and CLI frontends.
 
 [features]
 default = ["tui"]
-tui = ["dep:ratatui", "dep:crossterm"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:arboard"]
 
 [dependencies]
 # Use latest stable versions for every dependency listed below.
@@ -38,13 +38,19 @@ parking_lot = "*"
 rand = "*"
 time = { version = "*", features = ["macros", "formatting"] }
 once_cell = "*"
+chacha20poly1305 = { version = "*", features = ["std"] }
+x25519-dalek = { version = "*", default-features = false, features = ["u64_backend"] }
+rand_core = { version = "0.5", features = ["getrandom"] }
+unicode-width = "*"
+flate2 = "*"
+tempfile = "*"
 
 # Optional TUI stack; enabled via the default `tui` feature.
 ratatui = { version = "*", optional = true, default-features = false, features = ["crossterm"] }
 crossterm = { version = "*", optional = true }
+arboard = { version = "*", optional = true }
 
 [dev-dependencies]
 # Use latest stable versions for dev tooling as well.
 tokio = { version = "*", features = ["full"] }
-tempfile = "*"
 assert_cmd = "*"
