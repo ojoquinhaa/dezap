@@ -13,6 +13,9 @@ use textwrap::wrap;
 use super::app::{App, ConnectionStatus, MessageDirection, Mode, PanelFocus};
 
 const BANNER_LINE: &str = "Retro LAN QUIC Messenger";
+const TRANSCRIPT_TITLE: &str =
+    "Transcript view • Esc/i exit • / find • ↑/↓ scroll • PgUp/PgDn faster";
+const CRIMSON: Color = Color::Rgb(220, 20, 60);
 const DEMON_LINES: [&str; 7] = [
     "⠀⠀⠀⠀⠀⠀⢀⣤⡄⠀⠀⠀⠀⠀⠀⠀⢤⣤⡀⠀⠀⠀",
     "⠀⠀⠀⠀⠀⣰⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⢻⣿⣆⠀⠀",
@@ -24,6 +27,10 @@ const DEMON_LINES: [&str; 7] = [
 ];
 
 pub fn draw(frame: &mut Frame<'_>, app: &App) {
+    if app.raw_transcript() {
+        draw_transcript(frame, frame.area(), app);
+        return;
+    }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
@@ -37,6 +44,77 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_messages(frame, chat[0], app);
     draw_input(frame, chat[1], app);
     draw_sidebar(frame, columns[1], app);
+}
+
+fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
+        .split(area);
+
+    let status = match app.connection {
+        ConnectionStatus::Disconnected => "Disconnected".to_string(),
+        ConnectionStatus::Listening { addr, locked } => {
+            if locked {
+                format!("Listening on {addr} 🔒")
+            } else {
+                format!("Listening on {addr}")
+            }
+        }
+        ConnectionStatus::Connecting(addr) => format!("Connecting to {addr}…"),
+        ConnectionStatus::Connected { ref name, peer } => {
+            format!("Connected to {name} ({peer})")
+        }
+    };
+    let header_lines = vec![
+        Line::from(Span::styled(
+            "Conversation transcript",
+            Style::default().fg(CRIMSON).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(
+                format!("You: @{}", app.username),
+                Style::default().fg(CRIMSON),
+            ),
+            Span::raw(" • "),
+            Span::styled(
+                format!("Messages: {}", app.messages.len()),
+                Style::default().fg(CRIMSON),
+            ),
+            Span::raw(" • "),
+            Span::styled(status, Style::default().fg(CRIMSON)),
+        ]),
+        Line::from(Span::styled(
+            "Select and copy freely • / find • Esc/i to return",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    let header = Paragraph::new(header_lines).alignment(Alignment::Left);
+    frame.render_widget(header, chunks[0]);
+
+    frame.render_widget(Paragraph::new(""), chunks[1]);
+
+    let lines = app.transcript_lines();
+    let view_height = chunks[2].height.saturating_sub(2) as usize;
+    let max_offset = lines.len().saturating_sub(view_height);
+    let offset = app.transcript_offset().min(max_offset);
+    let text = lines.join("\n");
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((offset as u16, 0))
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    TRANSCRIPT_TITLE,
+                    Style::default().fg(CRIMSON).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::NONE),
+        );
+    frame.render_widget(paragraph, chunks[2]);
 }
 
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {

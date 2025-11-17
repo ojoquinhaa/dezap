@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use arboard::Clipboard;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
+use crossterm::ExecutableCommand;
 use ratatui::style::Color;
 use time::OffsetDateTime;
 
@@ -51,6 +54,10 @@ pub struct App {
     pub chat_focus: bool,
     pub selected_message: Option<usize>,
     pub marked_messages: HashSet<usize>,
+    raw_transcript: bool,
+    raw_transcript_offset: usize,
+    raw_transcript_searching: bool,
+    transcript_search: String,
     clipboard: Option<Clipboard>,
     download_dir: PathBuf,
     offer_queue: VecDeque<FileOfferNotice>,
@@ -85,6 +92,10 @@ impl App {
             chat_focus: false,
             selected_message: None,
             marked_messages: HashSet::new(),
+            raw_transcript: false,
+            raw_transcript_offset: 0,
+            raw_transcript_searching: false,
+            transcript_search: String::new(),
             clipboard: Clipboard::new().ok(),
             download_dir: config.paths.download_dir.clone(),
             offer_queue: VecDeque::new(),
@@ -124,6 +135,29 @@ impl App {
         }
 
         if self.chat_focus {
+            if self.raw_transcript && self.raw_transcript_searching {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.cancel_transcript_search();
+                        return None;
+                    }
+                    KeyCode::Enter => {
+                        self.apply_transcript_search();
+                        return None;
+                    }
+                    KeyCode::Backspace => {
+                        self.transcript_search.pop();
+                        self.update_transcript_search_status();
+                        return None;
+                    }
+                    KeyCode::Char(ch) if !ctrl => {
+                        self.transcript_search.push(ch);
+                        self.update_transcript_search_status();
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.leave_chat_focus();
@@ -133,12 +167,36 @@ impl App {
                     self.leave_chat_focus();
                     return None;
                 }
+                KeyCode::Char(ch) if !ctrl && ch.eq_ignore_ascii_case(&'i') => {
+                    self.toggle_raw_transcript();
+                    return None;
+                }
+                KeyCode::Char(ch) if !ctrl && ch == '/' && self.raw_transcript => {
+                    self.start_transcript_search();
+                    return None;
+                }
+                KeyCode::PageUp if self.raw_transcript => {
+                    self.scroll_transcript(-10);
+                    return None;
+                }
+                KeyCode::PageDown if self.raw_transcript => {
+                    self.scroll_transcript(10);
+                    return None;
+                }
                 KeyCode::Up => {
-                    self.move_selection(-1);
+                    if self.raw_transcript {
+                        self.scroll_transcript(-1);
+                    } else {
+                        self.move_selection(-1);
+                    }
                     return None;
                 }
                 KeyCode::Down => {
-                    self.move_selection(1);
+                    if self.raw_transcript {
+                        self.scroll_transcript(1);
+                    } else {
+                        self.move_selection(1);
+                    }
                     return None;
                 }
                 KeyCode::Char(ch) if !ctrl && ch.eq_ignore_ascii_case(&'v') => {
@@ -279,6 +337,7 @@ impl App {
     fn leave_chat_focus(&mut self) {
         self.chat_focus = false;
         self.selected_message = None;
+        self.exit_raw_transcript();
     }
 
     fn focus_discovered_panel(&mut self) {
@@ -401,6 +460,9 @@ impl App {
             self.show_warning("Press Ctrl+G to browse chat first.");
             return;
         }
+        if self.raw_transcript {
+            self.exit_raw_transcript();
+        }
         let (payload, count) = match self.build_copy_payload() {
             Ok(payload) => payload,
             Err(msg) => {
@@ -505,6 +567,97 @@ impl App {
         }
     }
 
+    fn scroll_transcript(&mut self, delta: isize) {
+        let current = self.raw_transcript_offset as isize;
+        let mut next = current.saturating_add(delta);
+        if next < 0 {
+            next = 0;
+        }
+        let max_offset = self.transcript_lines().len().saturating_sub(1) as isize;
+        self.raw_transcript_offset = next.min(max_offset.max(0)) as usize;
+    }
+
+    fn start_transcript_search(&mut self) {
+        self.raw_transcript_searching = true;
+        self.transcript_search.clear();
+        self.status_line = "Find in transcript: type and press Enter (Esc to cancel)".into();
+    }
+
+    fn cancel_transcript_search(&mut self) {
+        self.raw_transcript_searching = false;
+        self.transcript_search.clear();
+        self.status_line = "Transcript mode • Esc or 'i' to close".into();
+    }
+
+    fn update_transcript_search_status(&mut self) {
+        self.status_line = format!("Find: {}", self.transcript_search);
+    }
+
+    fn apply_transcript_search(&mut self) {
+        if self.transcript_search.trim().is_empty() {
+            self.show_warning("Enter text to search.");
+            return;
+        }
+        let query = self.transcript_search.to_lowercase();
+        let lines = self.transcript_lines();
+        if lines.is_empty() {
+            self.show_warning("No messages to view.");
+            return;
+        }
+        let start = self
+            .raw_transcript_offset
+            .min(lines.len().saturating_sub(1));
+        let mut found: Option<usize> = None;
+        for (idx, line) in lines.iter().enumerate().skip(start) {
+            if line.to_lowercase().contains(&query) {
+                found = Some(idx);
+                break;
+            }
+        }
+        if found.is_none() && start > 0 {
+            for (idx, line) in lines.iter().enumerate().take(start) {
+                if line.to_lowercase().contains(&query) {
+                    found = Some(idx);
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = found {
+            self.raw_transcript_offset = idx;
+            self.status_line = format!("Match at line {}", idx + 1);
+            self.raw_transcript_searching = false;
+        } else {
+            self.show_warning("No matches found.");
+        }
+    }
+
+    fn toggle_raw_transcript(&mut self) {
+        if self.raw_transcript {
+            self.exit_raw_transcript();
+            return;
+        }
+        if self.messages.is_empty() {
+            self.show_warning("No messages to view.");
+            return;
+        }
+        self.raw_transcript = true;
+        self.raw_transcript_offset = 0;
+        self.raw_transcript_searching = false;
+        self.transcript_search.clear();
+        self.status_line = "Transcript mode • Esc or 'i' to close".into();
+        let _ = std::io::stdout().execute(DisableMouseCapture);
+    }
+
+    fn exit_raw_transcript(&mut self) {
+        if self.raw_transcript {
+            self.raw_transcript = false;
+            self.raw_transcript_offset = 0;
+            self.raw_transcript_searching = false;
+            self.transcript_search.clear();
+            let _ = std::io::stdout().execute(EnableMouseCapture);
+        }
+    }
+
     fn enqueue_offer(&mut self, offer: FileOfferNotice) {
         if self.active_offer.is_none() {
             self.activate_offer(offer);
@@ -549,6 +702,31 @@ impl App {
                     .min(self.discovered.len().saturating_sub(1)),
             )
         }
+    }
+
+    pub fn raw_transcript(&self) -> bool {
+        self.raw_transcript
+    }
+
+    pub fn transcript_lines(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .flat_map(|entry| {
+                if entry.text.contains('\n') {
+                    entry
+                        .text
+                        .lines()
+                        .map(|line| line.to_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![entry.text.clone()]
+                }
+            })
+            .collect()
+    }
+
+    pub fn transcript_offset(&self) -> usize {
+        self.raw_transcript_offset
     }
 
     pub fn selected_saved(&self) -> Option<usize> {
