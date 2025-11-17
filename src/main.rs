@@ -13,9 +13,15 @@ use dezap::tui;
 async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let config = AppConfig::load(cli.config_path())?;
-    logging::init(&config.logging, cli.verbosity())?;
+    let command = cli.command_or_default();
+    let is_tui = matches!(command, Commands::Tui(_));
+    if is_tui {
+        logging::init_quiet(&config.logging, cli.verbosity())?;
+    } else {
+        logging::init(&config.logging, cli.verbosity())?;
+    }
 
-    match cli.command_or_default() {
+    match command {
         Commands::Listen(cmd) => service::run_listener(&config, cmd).await,
         Commands::Send(cmd) => service::run_cli_message(&config, cmd).await,
         Commands::SendFile(cmd) => service::run_cli_file_send(&config, cmd).await,

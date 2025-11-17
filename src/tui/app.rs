@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -48,6 +48,7 @@ pub struct App {
     selected_peer: usize,
     pub chat_focus: bool,
     pub selected_message: Option<usize>,
+    pub marked_messages: HashSet<usize>,
     download_dir: PathBuf,
     offer_queue: VecDeque<FileOfferNotice>,
     active_offer: Option<FileOfferNotice>,
@@ -80,6 +81,7 @@ impl App {
             selected_peer: 0,
             chat_focus: false,
             selected_message: None,
+            marked_messages: HashSet::new(),
             download_dir: config.paths.download_dir.clone(),
             offer_queue: VecDeque::new(),
             active_offer: None,
@@ -133,6 +135,10 @@ impl App {
                 }
                 KeyCode::Down => {
                     self.move_selection(1);
+                    return None;
+                }
+                KeyCode::Char(ch) if !ctrl && ch.eq_ignore_ascii_case(&'v') => {
+                    self.toggle_marked_message();
                     return None;
                 }
                 KeyCode::Char(ch) if !ctrl && ch.eq_ignore_ascii_case(&'c') => {
@@ -262,7 +268,8 @@ impl App {
         {
             self.selected_message = Some(self.messages.len().saturating_sub(1));
         }
-        self.status_line = "Browsing chat • use ↑/↓ to navigate, 'c' to copy, Esc to exit.".into();
+        self.status_line =
+            "Browsing chat • ↑/↓ move, 'v' mark/unmark, 'c' copy selection, Esc to exit.".into();
     }
 
     fn leave_chat_focus(&mut self) {
@@ -390,21 +397,54 @@ impl App {
             self.show_warning("Press Ctrl+G to browse chat first.");
             return;
         }
-        let idx = match self.selected_message {
-            Some(idx) => idx,
-            None => {
-                self.show_warning("No message selected.");
-                return;
-            }
-        };
-        let Some(entry) = self.messages.get(idx) else {
-            self.show_warning("Selected message is unavailable.");
+        if self.messages.is_empty() {
+            self.show_warning("No messages to copy.");
             return;
+        }
+        let mut targets: Vec<usize> = if self.marked_messages.is_empty() {
+            match self.selected_message {
+                Some(idx) => vec![idx],
+                None => {
+                    self.show_warning("No message selected.");
+                    return;
+                }
+            }
+        } else {
+            self.marked_messages.iter().copied().collect()
         };
-        let payload = entry.text.clone();
+        targets.sort_unstable();
+        targets.dedup();
+        let mut payloads: Vec<String> = Vec::new();
+        for idx in targets.into_iter() {
+            if let Some(entry) = self.messages.get(idx) {
+                payloads.push(entry.text.clone());
+            }
+        }
+        if payloads.is_empty() {
+            self.show_warning("Selected messages are unavailable.");
+            self.clamp_selection();
+            return;
+        }
+        let payload = payloads.join("\n");
         match Clipboard::new().and_then(|mut clip| clip.set_text(payload)) {
             Ok(_) => {
-                self.status_line = format!("Copied message from {}", entry.author);
+                if self.marked_messages.is_empty() {
+                    if let Some(idx) = self.selected_message {
+                        if let Some(entry) = self.messages.get(idx) {
+                            self.status_line = format!("Copied message from {}", entry.author);
+                        } else {
+                            self.status_line = "Copied message".into();
+                        }
+                    } else {
+                        self.status_line = "Copied message".into();
+                    }
+                } else {
+                    self.status_line = format!(
+                        "Copied {} marked message{}",
+                        self.marked_messages.len(),
+                        if self.marked_messages.len() == 1 { "" } else { "s" }
+                    );
+                }
             }
             Err(err) => {
                 self.show_error(format!("Clipboard error: {err}"));
@@ -799,22 +839,37 @@ impl App {
     }
 
     fn update_transfer(&mut self, progress: FileTransferProgress) {
+        let mut was_completed = false;
         if let Some(existing) = self.transfers.iter_mut().find(|t| t.id == progress.id) {
+            was_completed = existing.completed;
             existing.transferred = progress.transferred;
             existing.total = progress.total;
             existing.completed = progress.completed;
             existing.path = progress.path.clone();
-            return;
+        } else {
+            self.transfers.push(TransferState {
+                id: progress.id,
+                name: progress.name.clone(),
+                direction: progress.direction,
+                transferred: progress.transferred,
+                total: progress.total,
+                path: progress.path.clone(),
+                completed: progress.completed,
+            });
         }
-        self.transfers.push(TransferState {
-            id: progress.id,
-            name: progress.name.clone(),
-            direction: progress.direction,
-            transferred: progress.transferred,
-            total: progress.total,
-            path: progress.path,
-            completed: progress.completed,
-        });
+        if progress.completed && !was_completed {
+            let size = human_size(progress.total.max(progress.transferred));
+            let where_to = progress
+                .path
+                .as_ref()
+                .map(|p| format!(" at {}", p.display()))
+                .unwrap_or_default();
+            let verb = match progress.direction {
+                TransferDirection::Incoming => "Received",
+                TransferDirection::Outgoing => "Sent",
+            };
+            self.push_system(format!("{verb} '{}' ({size}){where_to}", progress.name));
+        }
     }
 
     fn push_message(&mut self, direction: MessageDirection, text: String) {
@@ -827,6 +882,11 @@ impl App {
                     self.selected_message = Some(idx - 1);
                 }
             }
+            self.marked_messages = self
+                .marked_messages
+                .iter()
+                .filter_map(|idx| idx.checked_sub(1))
+                .collect();
         }
         let author = direction.source().to_string();
         self.messages.push(ChatEntry {
@@ -881,12 +941,36 @@ impl App {
     fn clamp_selection(&mut self) {
         if self.messages.is_empty() {
             self.selected_message = None;
+            self.marked_messages.clear();
             return;
         }
         if let Some(idx) = self.selected_message {
             if idx >= self.messages.len() {
                 self.selected_message = Some(self.messages.len().saturating_sub(1));
             }
+        }
+        let len = self.messages.len();
+        self.marked_messages.retain(|idx| *idx < len);
+    }
+
+    fn toggle_marked_message(&mut self) {
+        if !self.chat_focus {
+            self.show_warning("Press Ctrl+G to browse chat first.");
+            return;
+        }
+        let Some(idx) = self.selected_message else {
+            self.show_warning("No message selected.");
+            return;
+        };
+        let Some(entry) = self.messages.get(idx) else {
+            self.show_warning("Selected message is unavailable.");
+            return;
+        };
+        if self.marked_messages.remove(&idx) {
+            self.status_line = format!("Unmarked message from {}", entry.author);
+        } else {
+            self.marked_messages.insert(idx);
+            self.status_line = format!("Marked message from {}", entry.author);
         }
     }
 }

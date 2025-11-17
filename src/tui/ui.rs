@@ -42,54 +42,59 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let fmt = format_description!("[hour]:[minute]:[second]");
     let inner_width = area.width.saturating_sub(4).max(10) as usize;
-    let items: Vec<ListItem<'static>> = app
-        .messages
-        .iter()
-        .map(|entry| {
-            let ts = entry
-                .timestamp
-                .format(fmt)
-                .unwrap_or_else(|_| "--:--".into());
-            let label: Cow<'_, str> = match &entry.direction {
-                MessageDirection::System => Cow::Borrowed("system"),
-                MessageDirection::Warning => Cow::Borrowed("⚠ warning"),
-                MessageDirection::Error => Cow::Borrowed("⛔ error"),
-                _ => Cow::Borrowed(entry.author.as_str()),
-            };
-            let prefix = format!("[{ts}] {} • ", label);
-            let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-            let available = inner_width.saturating_sub(prefix_width).max(1);
-            let wrapped = wrap(&entry.text, available)
-                .into_iter()
-                .map(|cow| cow.to_string())
-                .collect::<Vec<_>>();
-            let pieces = if wrapped.is_empty() {
-                vec![String::new()]
-            } else {
-                wrapped
-            };
-            let indent = " ".repeat(prefix_width);
-            let mut lines = Vec::new();
-            if let Some(first) = pieces.first() {
+    let mut items: Vec<ListItem<'static>> = Vec::with_capacity(app.messages.len());
+    let mut heights: Vec<usize> = Vec::with_capacity(app.messages.len());
+    for (idx, entry) in app.messages.iter().enumerate() {
+        let ts = entry
+            .timestamp
+            .format(fmt)
+            .unwrap_or_else(|_| "--:--".into());
+        let label: Cow<'_, str> = match &entry.direction {
+            MessageDirection::System => Cow::Borrowed("system"),
+            MessageDirection::Warning => Cow::Borrowed("⚠ warning"),
+            MessageDirection::Error => Cow::Borrowed("⛔ error"),
+            _ => Cow::Borrowed(entry.author.as_str()),
+        };
+        let marker = if app.marked_messages.contains(&idx) {
+            "✔ "
+        } else {
+            "  "
+        };
+        let prefix = format!("{marker}[{ts}] {} • ", label);
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let available = inner_width.saturating_sub(prefix_width).max(1);
+        let wrapped = wrap(&entry.text, available)
+            .into_iter()
+            .map(|cow| cow.to_string())
+            .collect::<Vec<_>>();
+        let pieces = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped
+        };
+        let indent = " ".repeat(prefix_width);
+        let mut lines = Vec::new();
+        if let Some(first) = pieces.first() {
+            lines.push(Line::from(vec![
+                Span::styled(prefix.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(first.clone(), Style::default().fg(entry.direction.style())),
+            ]));
+            for rest in pieces.iter().skip(1) {
                 lines.push(Line::from(vec![
-                    Span::styled(prefix.clone(), Style::default().fg(Color::Gray)),
-                    Span::styled(first.clone(), Style::default().fg(entry.direction.style())),
+                    Span::raw(indent.clone()),
+                    Span::styled(rest.clone(), Style::default().fg(entry.direction.style())),
                 ]));
-                for rest in pieces.iter().skip(1) {
-                    lines.push(Line::from(vec![
-                        Span::raw(indent.clone()),
-                        Span::styled(rest.clone(), Style::default().fg(entry.direction.style())),
-                    ]));
-                }
             }
-            ListItem::new(lines)
-        })
-        .collect();
+        }
+        heights.push(pieces.len().max(1));
+        items.push(ListItem::new(lines));
+    }
     let title = if app.chat_focus {
-        "Chat ▸ browse (Esc to exit, ↑/↓ move, C copy)"
+        "Chat ▸ browse (Esc to exit, ↑/↓ move, V mark, C copy)"
     } else {
         "Chat"
     };
+    let has_items = !items.is_empty();
     let list = List::new(items)
         .block(
             Block::default()
@@ -100,15 +105,71 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .highlight_symbol("› ")
         .highlight_style(Style::default().bg(app.accent).fg(Color::Black));
     let mut state = ListState::default();
+    let view_height = area.height.saturating_sub(2) as usize;
     if app.chat_focus {
-        state.select(app.selected_message);
-    } else if !app.messages.is_empty() {
-        let inner_height = area.height.saturating_sub(2) as usize;
-        let visible = inner_height.max(1);
-        *state.offset_mut() = app.messages.len().saturating_sub(visible);
+        if let Some(selected) = app.selected_message {
+            *state.offset_mut() = list_offset_for_selection(&heights, view_height, selected);
+            state.select(Some(selected));
+        }
+    } else if has_items {
+        *state.offset_mut() = list_offset_from_bottom(&heights, view_height);
         state.select(None);
     }
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn list_offset_from_bottom(heights: &[usize], view_height: usize) -> usize {
+    if heights.is_empty() || view_height == 0 {
+        return 0;
+    }
+    let mut used = 0usize;
+    let mut offset = heights.len().saturating_sub(1);
+    for (idx, height) in heights.iter().enumerate().rev() {
+        let next_used = used.saturating_add(*height);
+        if next_used > view_height && used > 0 {
+            offset = idx.saturating_add(1);
+            break;
+        }
+        offset = idx;
+        used = next_used.min(view_height);
+    }
+    offset.min(heights.len().saturating_sub(1))
+}
+
+fn list_offset_for_selection(heights: &[usize], view_height: usize, selected: usize) -> usize {
+    if heights.is_empty() || view_height == 0 {
+        return 0;
+    }
+    let selected = selected.min(heights.len().saturating_sub(1));
+    let tail_height: usize = heights[selected..].iter().sum();
+    if tail_height <= view_height {
+        // We can show everything from the selection downwards; include as much context above as fits.
+        let mut used = tail_height;
+        let mut offset = 0usize;
+        for (idx, height) in heights[..selected].iter().enumerate().rev() {
+            if used.saturating_add(*height) > view_height {
+                offset = idx.saturating_add(1);
+                break;
+            }
+            used = used.saturating_add(*height);
+            offset = idx;
+        }
+        offset
+    } else {
+        // The tail alone overflows the viewport; slide the window until the selection fits.
+        let mut used = 0usize;
+        let mut offset = selected;
+        for i in (0..=selected).rev() {
+            let next_used = used.saturating_add(heights[i]);
+            if next_used > view_height && used > 0 {
+                offset = i.saturating_add(1);
+                break;
+            }
+            offset = i;
+            used = next_used.min(view_height);
+        }
+        offset
+    }
 }
 
 fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -369,8 +430,8 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Mode::DiscoveryNetwork => "Discovery broadcast",
         Mode::IncomingFile(_) => "Save incoming file as",
     };
-    let input_height = rows[0].height.max(1);
-    let input_width = rows[0].width.max(1);
+    let input_height = rows[0].height.saturating_sub(2).max(1);
+    let input_width = rows[0].width.saturating_sub(2).max(1);
     let (total_lines, cursor_line, cursor_col) = measure_input(&app.input, input_width as usize);
     let scroll = total_lines.saturating_sub(input_height as usize);
     let visible_cursor_line = cursor_line.saturating_sub(scroll);
