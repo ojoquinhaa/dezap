@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chacha20poly1305::aead::{generic_array::GenericArray, Aead, KeyInit};
@@ -98,6 +98,9 @@ pub enum ServiceCommand {
     },
     DeclineFile {
         id: u64,
+    },
+    SetHistoryEnabled {
+        enabled: bool,
     },
 }
 
@@ -254,6 +257,7 @@ struct ServiceState {
     pending_transfers: Arc<Mutex<HashMap<u64, PreparedTransfer>>>,
     incoming_offers: Arc<Mutex<HashMap<u64, FileOfferNotice>>>,
     incoming_transfers: Arc<Mutex<HashMap<u64, IncomingTransfer>>>,
+    history_enabled: Arc<AtomicBool>,
 }
 
 impl ServiceState {
@@ -269,6 +273,7 @@ impl ServiceState {
         let pending_transfers = Arc::new(Mutex::new(HashMap::new()));
         let incoming_offers = Arc::new(Mutex::new(HashMap::new()));
         let incoming_transfers = Arc::new(Mutex::new(HashMap::new()));
+        let history_enabled = Arc::new(AtomicBool::new(true));
         Self {
             config,
             event_tx,
@@ -284,6 +289,7 @@ impl ServiceState {
             pending_transfers,
             incoming_offers,
             incoming_transfers,
+            history_enabled,
         }
     }
 
@@ -306,6 +312,10 @@ impl ServiceState {
             }
             ServiceCommand::AcceptFile { id, path } => self.accept_file(id, path).await,
             ServiceCommand::DeclineFile { id } => self.decline_file(id).await,
+            ServiceCommand::SetHistoryEnabled { enabled } => {
+                self.history_enabled.store(enabled, Ordering::Relaxed);
+                Ok(())
+            }
         }
     }
 
@@ -441,6 +451,7 @@ impl ServiceState {
             &self.event_tx,
             meta,
             self.history.clone(),
+            self.history_enabled.clone(),
         )
         .await?;
         persist_chat(
@@ -609,6 +620,7 @@ impl ServiceState {
             required_password: required_password.clone(),
             meta: meta.clone(),
             history: self.history.clone(),
+            history_enabled: self.history_enabled.clone(),
             peers: self.peers.clone(),
             pending_transfers: self.pending_transfers.clone(),
             incoming_offers: self.incoming_offers.clone(),
@@ -750,6 +762,7 @@ struct PeerContext {
     required_password: Option<String>,
     meta: ConnectionMeta,
     history: Arc<HistoryWriter>,
+    history_enabled: Arc<AtomicBool>,
     peers: Arc<SavedPeersStore>,
     pending_transfers: Arc<Mutex<HashMap<u64, PreparedTransfer>>>,
     incoming_offers: Arc<Mutex<HashMap<u64, FileOfferNotice>>>,
@@ -918,6 +931,7 @@ async fn send_text_message(
     event_tx: &mpsc::Sender<ServiceEvent>,
     meta: ConnectionMeta,
     history: Arc<HistoryWriter>,
+    history_enabled: Arc<AtomicBool>,
 ) -> Result<()> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -946,17 +960,19 @@ async fn send_text_message(
         })
         .await
         .ok();
-    history
-        .record(
-            peer,
-            HistoryEntry {
-                timestamp: protocol::utc_timestamp(),
-                outgoing: true,
-                author: author.to_string(),
-                text: trimmed.to_string(),
-            },
-        )
-        .ok();
+    if history_enabled.load(Ordering::Relaxed) {
+        history
+            .record(
+                peer,
+                HistoryEntry {
+                    timestamp: protocol::utc_timestamp(),
+                    outgoing: true,
+                    author: author.to_string(),
+                    text: trimmed.to_string(),
+                },
+            )
+            .ok();
+    }
     Ok(())
 }
 
@@ -1100,17 +1116,19 @@ async fn handle_stream(
             )
             .await
             .ok();
-            ctx.history
-                .record(
-                    peer,
-                    HistoryEntry {
-                        timestamp: text.timestamp,
-                        outgoing: false,
-                        author: text.author.clone(),
-                        text: text.body.clone(),
-                    },
-                )
-                .ok();
+            if ctx.history_enabled.load(Ordering::Relaxed) {
+                ctx.history
+                    .record(
+                        peer,
+                        HistoryEntry {
+                            timestamp: text.timestamp,
+                            outgoing: false,
+                            author: text.author.clone(),
+                            text: text.body.clone(),
+                        },
+                    )
+                    .ok();
+            }
         }
         Some(WireMessage::FileMeta(meta)) => {
             receive_file_stream(recv, meta, event_tx.clone(), peer, ctx.clone()).await?;
@@ -1134,17 +1152,19 @@ async fn handle_stream(
                 )
                 .await
                 .ok();
-                ctx.history
-                    .record(
-                        peer,
-                        HistoryEntry {
-                            timestamp: text.timestamp,
-                            outgoing: false,
-                            author: text.author.clone(),
-                            text: text.body.clone(),
-                        },
-                    )
-                    .ok();
+                if ctx.history_enabled.load(Ordering::Relaxed) {
+                    ctx.history
+                        .record(
+                            peer,
+                            HistoryEntry {
+                                timestamp: text.timestamp,
+                                outgoing: false,
+                                author: text.author.clone(),
+                                text: text.body.clone(),
+                            },
+                        )
+                        .ok();
+                }
             }
             Err(err) => {
                 event_tx

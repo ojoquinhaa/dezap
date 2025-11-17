@@ -1,16 +1,22 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use chacha20poly1305::{
+    aead::{Aead, generic_array::GenericArray, KeyInit},
+    ChaCha20Poly1305,
+};
 use arboard::Clipboard;
+use flate2::read::GzDecoder;
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::ExecutableCommand;
 use ratatui::style::Color;
+use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::cli::TuiCommand;
@@ -25,6 +31,21 @@ pub enum PanelFocus {
     None,
     Discovered,
     Saved,
+}
+
+#[derive(Debug, Clone)]
+struct HistoryPrompt {
+    name: String,
+    path: PathBuf,
+    bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StoredHistoryEntry {
+    timestamp: i64,
+    outgoing: bool,
+    author: String,
+    text: String,
 }
 
 const MAX_MESSAGES: usize = 512;
@@ -58,12 +79,15 @@ pub struct App {
     raw_transcript_offset: usize,
     raw_transcript_searching: bool,
     transcript_search: String,
+    history_dir: PathBuf,
+    history_disabled: bool,
     clipboard: Option<Clipboard>,
     download_dir: PathBuf,
     offer_queue: VecDeque<FileOfferNotice>,
     active_offer: Option<FileOfferNotice>,
     panel_focus: PanelFocus,
     saved_peer_index: usize,
+    history_prompt: Option<HistoryPrompt>,
 }
 
 impl App {
@@ -96,17 +120,24 @@ impl App {
             raw_transcript_offset: 0,
             raw_transcript_searching: false,
             transcript_search: String::new(),
+            history_dir: config.paths.history_dir.clone(),
+            history_disabled: false,
             clipboard: Clipboard::new().ok(),
             download_dir: config.paths.download_dir.clone(),
             offer_queue: VecDeque::new(),
             active_offer: None,
             panel_focus: PanelFocus::None,
             saved_peer_index: 0,
+            history_prompt: None,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<ServiceCommand> {
         if key.kind != KeyEventKind::Press {
+            return None;
+        }
+
+        if self.consume_history_prompt(&key) {
             return None;
         }
 
@@ -207,6 +238,10 @@ impl App {
                     self.copy_selected_message();
                     return None;
                 }
+                KeyCode::Char('/') if !ctrl && self.raw_transcript => {
+                    self.start_transcript_search();
+                    return None;
+                }
                 _ => {}
             }
             if key.modifiers.is_empty() {
@@ -304,6 +339,7 @@ impl App {
             }
             _ => {}
         }
+        self.update_command_hint();
         None
     }
 
@@ -567,6 +603,27 @@ impl App {
         }
     }
 
+    fn update_command_hint(&mut self) {
+        if self.mode != Mode::Chat {
+            return;
+        }
+        if let Some(rest) = self.input.strip_prefix("d/") {
+            let trimmed = rest.trim();
+            let cmds = [
+                "clear", "save", "search", "mark", "last", "status", "purge", "anon", "help", "history",
+            ];
+            if trimmed.is_empty() {
+                self.status_line =
+                    "Commands: clear, save, search, mark, last, status, purge, anon, help, history"
+                        .into();
+            } else if cmds.iter().any(|c| c.starts_with(trimmed)) {
+                self.status_line = format!("Commands: {}", cmds.join(", "));
+            } else {
+                self.status_line = "Unknown command (try d/help)".into();
+            }
+        }
+    }
+
     fn scroll_transcript(&mut self, delta: isize) {
         let current = self.raw_transcript_offset as isize;
         let mut next = current.saturating_add(delta);
@@ -583,10 +640,389 @@ impl App {
         self.status_line = "Find in transcript: type and press Enter (Esc to cancel)".into();
     }
 
+    fn clear_chat(&mut self) {
+        self.messages.clear();
+        self.selected_message = None;
+        self.marked_messages.clear();
+        self.raw_transcript_offset = 0;
+        self.raw_transcript_searching = false;
+        self.transcript_search.clear();
+    }
+
+    fn handle_command(&mut self, raw: &str) -> Option<ServiceCommand> {
+        let mut parts = raw.split_whitespace();
+        let cmd = parts.next().unwrap_or("").to_ascii_lowercase();
+        let args: Vec<&str> = parts.collect();
+        let result = match cmd.as_str() {
+            "clear" => {
+                self.clear_chat();
+                self.input.clear();
+                self.status_line = "Chat cleared.".into();
+                None
+            }
+            "save" => {
+                if args.is_empty() {
+                    self.show_warning("Usage: d/save <path>");
+                } else {
+                    let path = args.join(" ");
+                    match self.save_transcript(&path) {
+                        Ok(_) => self.status_line = format!("Saved transcript to {path}"),
+                        Err(err) => self.show_error(format!("Save failed: {err}")),
+                    }
+                }
+                self.input.clear();
+                None
+            }
+            "search" => {
+                if args.is_empty() {
+                    self.show_warning("Usage: d/search <term>");
+                } else {
+                    let term = args.join(" ");
+                    self.raw_transcript = true;
+                    self.raw_transcript_searching = true;
+                    self.transcript_search = term;
+                    self.apply_transcript_search();
+                }
+                self.input.clear();
+                None
+            }
+            "mark" => {
+                if args.is_empty() {
+                    self.show_warning("Usage: d/mark <term>");
+                } else {
+                    let term = args.join(" ").to_lowercase();
+                    let mut added = 0usize;
+                    for (idx, msg) in self.messages.iter().enumerate() {
+                        if msg.text.to_lowercase().contains(&term) {
+                            if self.marked_messages.insert(idx) {
+                                added += 1;
+                            }
+                        }
+                    }
+                    if added > 0 {
+                        self.status_line = format!("Marked {added} messages");
+                    } else {
+                        self.show_warning("No messages matched.");
+                    }
+                }
+                self.input.clear();
+                None
+            }
+            "last" => {
+                if args.is_empty() {
+                    self.show_warning("Usage: d/last <n>");
+                } else if let Ok(n) = args[0].parse::<usize>() {
+                    let lines = self.transcript_lines();
+                    let offset = lines.len().saturating_sub(n);
+                    self.raw_transcript = true;
+                    self.raw_transcript_offset = offset;
+                    self.status_line = format!("Jumped to last {n} messages");
+                } else {
+                    self.show_warning("Enter a valid number for d/last");
+                }
+                self.input.clear();
+                None
+            }
+            "status" => {
+                self.status_line = self.status_snapshot();
+                self.input.clear();
+                None
+            }
+            "purge" => {
+                self.clear_chat();
+                self.input.clear();
+                self.status_line = "Chat purged (in-memory)".into();
+                None
+            }
+            "anon" => {
+                self.history_disabled = !self.history_disabled;
+                let enabled = !self.history_disabled;
+                self.status_line = if self.history_disabled {
+                    "Modo anônimo ligado: histórico não será salvo".into()
+                } else {
+                    "Modo anônimo desligado: histórico voltará a ser salvo".into()
+                };
+                Some(ServiceCommand::SetHistoryEnabled { enabled })
+            }
+            "help" | "" => {
+                self.status_line =
+                    "Commands: clear, save <path>, search <term>, mark <term>, last <n>, status, purge, anon, help, history list|rm <peer>|rm-all"
+                        .into();
+                self.input.clear();
+                None
+            }
+            "history" => {
+                self.handle_history_command(args);
+                self.input.clear();
+                None
+            }
+            _ => {
+                self.show_warning("Unknown command. Try d/help");
+                self.input.clear();
+                None
+            }
+        };
+        result
+    }
+
     fn cancel_transcript_search(&mut self) {
         self.raw_transcript_searching = false;
         self.transcript_search.clear();
         self.status_line = "Transcript mode • Esc or 'i' to close".into();
+    }
+
+    fn save_transcript(&self, path: &str) -> io::Result<()> {
+        let lines = self.transcript_lines();
+        fs::write(path, lines.join("\n"))
+    }
+
+    fn handle_history_command(&mut self, args: Vec<&str>) {
+        if args.is_empty() {
+            self.show_warning("Usage: d/history list|rm <peer>|rm-all");
+            return;
+        }
+        match args[0] {
+            "list" => match fs::read_dir(&self.history_dir) {
+                Ok(entries) => {
+                    let mut names: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            e.path()
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect();
+                    names.sort();
+                    if names.is_empty() {
+                        self.status_line = "No history files found".into();
+                    } else {
+                        let preview = names.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+                        self.status_line = format!(
+                            "History files: {}{}",
+                            preview,
+                            if names.len() > 5 { " …" } else { "" }
+                        );
+                    }
+                }
+                Err(err) => self.show_error(format!("History list failed: {err}")),
+            },
+            "rm" => {
+                if args.len() < 2 {
+                    self.show_warning("Usage: d/history rm <peer>");
+                    return;
+                }
+                let target = args[1];
+                let pattern = target.replace(':', "_");
+                match fs::read_dir(&self.history_dir) {
+                    Ok(entries) => {
+                        let mut removed = 0;
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let name = entry.file_name();
+                            if let Some(n) = name.to_str() {
+                                if n.contains(&pattern) {
+                                    let _ = fs::remove_file(entry.path());
+                                    removed += 1;
+                                }
+                            }
+                        }
+                        if removed > 0 {
+                            self.status_line = format!("Removed {removed} history file(s)");
+                        } else {
+                            self.show_warning("No matching history files.");
+                        }
+                    }
+                    Err(err) => self.show_error(format!("History rm failed: {err}")),
+                }
+            }
+            "rm-all" => match fs::read_dir(&self.history_dir) {
+                Ok(entries) => {
+                    let mut removed = 0;
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let _ = fs::remove_file(entry.path());
+                        removed += 1;
+                    }
+                    self.status_line = format!("Removed {removed} history file(s)");
+                }
+                Err(err) => self.show_error(format!("Failed to purge history: {err}")),
+            },
+            _ => self.show_warning("Usage: d/history list|rm <peer>|rm-all"),
+        }
+    }
+
+    fn consume_history_prompt(&mut self, key: &KeyEvent) -> bool {
+        let Some(prompt) = self.history_prompt.clone() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'l') => {
+                self.load_history_from_prompt(prompt);
+            }
+            KeyCode::Char(ch) if ch.eq_ignore_ascii_case(&'n') => {
+                self.start_fresh_history(prompt);
+            }
+            KeyCode::Esc => {
+                self.history_prompt = None;
+                self.status_line.clear();
+            }
+            _ => {
+                self.status_line = self.history_prompt_message(&prompt);
+            }
+        }
+        true
+    }
+
+    fn load_history_from_prompt(&mut self, prompt: HistoryPrompt) {
+        self.history_prompt = None;
+        match self.read_history_entries(&prompt) {
+            Ok((entries, total, skipped)) => {
+                self.apply_history_entries(entries);
+                let shown = self.messages.len();
+                let mut note = format!(
+                    "Histórico de {} carregado ({shown} de {total} mensagens)",
+                    prompt.name
+                );
+                if skipped > 0 {
+                    note.push_str(&format!(" • {skipped} entrada(s) ignoradas"));
+                    self.push_warning(format!(
+                        "Algumas entradas antigas estavam corrompidas ({skipped} ignoradas)"
+                    ));
+                }
+                self.status_line = note.clone();
+                self.push_system(note);
+            }
+            Err(err) => {
+                self.show_error(format!("Falha ao carregar histórico: {err}"));
+            }
+        }
+    }
+
+    fn start_fresh_history(&mut self, prompt: HistoryPrompt) {
+        self.history_prompt = None;
+        match self.clear_history_file(&prompt.path) {
+            Ok(_) => {
+                self.status_line = format!("Novo histórico iniciado para {}", prompt.name);
+                self.push_system(format!(
+                    "Histórico antigo de {} limpo; começando do zero",
+                    prompt.name
+                ));
+            }
+            Err(err) => self.show_error(format!("Falha ao limpar histórico: {err}")),
+        }
+    }
+
+    fn apply_history_entries(&mut self, mut entries: Vec<ChatEntry>) {
+        if entries.len() > MAX_MESSAGES {
+            let excess = entries.len() - MAX_MESSAGES;
+            entries.drain(0..excess);
+        }
+        self.messages = entries;
+        self.selected_message = None;
+        self.marked_messages.clear();
+        self.raw_transcript_offset = 0;
+        self.raw_transcript_searching = false;
+        self.transcript_search.clear();
+        self.clamp_selection();
+    }
+
+    fn read_history_entries(
+        &self,
+        prompt: &HistoryPrompt,
+    ) -> Result<(Vec<ChatEntry>, usize, usize), String> {
+        let key = self
+            .load_history_key()
+            .map_err(|err| format!("chave do histórico ausente: {err}"))?;
+        let data = fs::read(&prompt.path)
+            .map_err(|err| format!("não foi possível abrir {}: {err}", prompt.path.display()))?;
+        if data.is_empty() {
+            return Ok((Vec::new(), 0, 0));
+        }
+        let cipher = ChaCha20Poly1305::new(GenericArray::from_slice(&key));
+        let mut offset = 0usize;
+        let mut entries: Vec<ChatEntry> = Vec::new();
+        let mut skipped = 0usize;
+        let mut total = 0usize;
+        while offset + 16 <= data.len() {
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&data[offset..offset + 12]);
+            offset += 12;
+            let slice = data
+                .get(offset..offset + 4)
+                .ok_or_else(|| "bloco de histórico truncado".to_string())?;
+            let len = u32::from_be_bytes(slice.try_into().unwrap_or_default()) as usize;
+            offset += 4;
+            if offset + len > data.len() {
+                break;
+            }
+            let ciphertext = &data[offset..offset + len];
+            offset += len;
+            total += 1;
+            let decrypted = match cipher.decrypt(GenericArray::from_slice(&nonce), ciphertext) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let mut decoder = GzDecoder::new(decrypted.as_slice());
+            let mut raw = Vec::new();
+            if decoder.read_to_end(&mut raw).is_err() {
+                skipped += 1;
+                continue;
+            }
+            let decoded: StoredHistoryEntry = match bincode::serde::decode_from_slice(
+                &raw,
+                bincode::config::standard(),
+            ) {
+                Ok((entry, _)) => entry,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let author = decoded.author;
+            let direction = if decoded.outgoing {
+                MessageDirection::Outgoing(author.clone())
+            } else {
+                MessageDirection::Incoming(author.clone())
+            };
+            entries.push(ChatEntry {
+                author,
+                direction,
+                text: decoded.text,
+                timestamp: OffsetDateTime::from_unix_timestamp(decoded.timestamp)
+                    .unwrap_or_else(|_| OffsetDateTime::now_utc()),
+            });
+        }
+        let total_count = total;
+        let start = entries.len().saturating_sub(MAX_MESSAGES);
+        let trimmed = entries.into_iter().skip(start).collect();
+        Ok((trimmed, total_count, skipped))
+    }
+
+    fn clear_history_file(&self, path: &Path) -> Result<(), String> {
+        if path.exists() {
+            fs::remove_file(path)
+                .map_err(|err| format!("não foi possível apagar {}: {err}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn load_history_key(&self) -> Result<[u8; 32], String> {
+        let path = self.history_dir.join("history.key");
+        let bytes =
+            fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+        if bytes.len() < 32 {
+            return Err("conteúdo inválido na key do histórico".into());
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes[..32]);
+        Ok(key)
+    }
+
+    fn history_file_for(&self, peer: SocketAddr) -> PathBuf {
+        let name = format!("{peer}").replace(':', "_");
+        self.history_dir.join(format!("{name}.hist"))
     }
 
     fn update_transcript_search_status(&mut self) {
@@ -693,6 +1129,10 @@ impl App {
         self.panel_focus
     }
 
+    pub fn history_disabled(&self) -> bool {
+        self.history_disabled
+    }
+
     pub fn selected_discovered(&self) -> Option<usize> {
         if self.discovered.is_empty() {
             None
@@ -727,6 +1167,32 @@ impl App {
 
     pub fn transcript_offset(&self) -> usize {
         self.raw_transcript_offset
+    }
+
+    pub fn status_snapshot(&self) -> String {
+        let conn = match self.connection.clone() {
+            ConnectionStatus::Disconnected => "Disconnected".into(),
+            ConnectionStatus::Listening { addr, locked } => {
+                if locked {
+                    format!("Listening on {addr} (locked)")
+                } else {
+                    format!("Listening on {addr}")
+                }
+            }
+            ConnectionStatus::Connecting(addr) => format!("Connecting to {addr}"),
+            ConnectionStatus::Connected { peer, name } => format!("Connected to {name} ({peer})"),
+        };
+        format!(
+            "User: @{} | Messages: {} | {} | Discovery: {}{} | History: {}",
+            self.username,
+            self.messages.len(),
+            conn,
+            if self.discovery_enabled { "on" } else { "off" },
+            self.discovery_target
+                .map(|ip| format!(" ({ip})"))
+                .unwrap_or_default(),
+            if self.history_disabled { "off" } else { "on" }
+        )
     }
 
     pub fn selected_saved(&self) -> Option<usize> {
@@ -857,7 +1323,12 @@ impl App {
     fn commit_input(&mut self) -> Option<ServiceCommand> {
         match self.mode {
             Mode::Chat => {
-                if self.input.trim().is_empty() {
+                let trimmed = self.input.trim();
+                if let Some(rest) = trimmed.strip_prefix("d/") {
+                    let cmdline = rest.trim().to_string();
+                    return self.handle_command(cmdline.as_str());
+                }
+                if trimmed.is_empty() {
                     self.show_warning("Cannot send empty message");
                     return None;
                 }
@@ -970,12 +1441,14 @@ impl App {
     pub fn handle_service_event(&mut self, event: ServiceEvent) {
         match event {
             ServiceEvent::Connected { peer, name } => {
+                self.history_prompt = None;
                 self.peer_names.insert(peer, name.clone());
                 self.connection = ConnectionStatus::Connected {
                     peer,
                     name: name.clone(),
                 };
                 self.push_system(format!("Connected to {name} ({peer})"));
+                self.maybe_prompt_history(peer, &name);
             }
             ServiceEvent::Connecting { peer } => {
                 self.connection = ConnectionStatus::Connecting(peer);
@@ -1000,6 +1473,7 @@ impl App {
                 self.push_system("Listener stopped");
             }
             ServiceEvent::Disconnected => {
+                self.history_prompt = None;
                 self.connection = ConnectionStatus::Disconnected;
                 self.push_system("Disconnected");
             }
@@ -1067,6 +1541,35 @@ impl App {
                 self.show_error(message);
             }
         }
+    }
+
+    fn maybe_prompt_history(&mut self, peer: SocketAddr, name: &str) {
+        let path = self.history_file_for(peer);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.len() > 0 => {
+                let prompt = HistoryPrompt {
+                    name: name.to_string(),
+                    path,
+                    bytes: Some(meta.len()),
+                };
+                self.status_line = self.history_prompt_message(&prompt);
+                self.history_prompt = Some(prompt);
+            }
+            _ => {
+                self.history_prompt = None;
+            }
+        }
+    }
+
+    fn history_prompt_message(&self, prompt: &HistoryPrompt) -> String {
+        let size_hint = prompt
+            .bytes
+            .map(|bytes| format!(" • {}", human_size(bytes)))
+            .unwrap_or_default();
+        format!(
+            "Histórico salvo com {}{} — L carregar · N começar do zero",
+            prompt.name, size_hint
+        )
     }
 
     fn update_transfer(&mut self, progress: FileTransferProgress) {
@@ -1403,5 +1906,47 @@ mod tests {
         let (payload, count) = app.build_copy_payload().expect("payload");
         assert_eq!(count, 1);
         assert_eq!(payload, "beta");
+    }
+
+    #[test]
+    fn anon_command_toggles_history_and_emits_service_command() {
+        let config = AppConfig::default();
+        let args = TuiCommand::default();
+        let mut app = App::new(&config, &args);
+        assert!(!app.history_disabled());
+
+        let first = app.handle_command("anon");
+        assert!(matches!(
+            first,
+            Some(ServiceCommand::SetHistoryEnabled { enabled: false })
+        ));
+        assert!(app.history_disabled());
+
+        let second = app.handle_command("anon");
+        assert!(matches!(
+            second,
+            Some(ServiceCommand::SetHistoryEnabled { enabled: true })
+        ));
+        assert!(!app.history_disabled());
+    }
+
+    #[test]
+    fn status_snapshot_includes_history_flag() {
+        let config = AppConfig::default();
+        let args = TuiCommand::default();
+        let mut app = App::new(&config, &args);
+
+        let default_status = app.status_snapshot();
+        assert!(
+            default_status.contains("History: on"),
+            "status should report history on by default: {default_status}"
+        );
+
+        app.history_disabled = true;
+        let anon_status = app.status_snapshot();
+        assert!(
+            anon_status.contains("History: off"),
+            "status should show history off when anon is active: {anon_status}"
+        );
     }
 }

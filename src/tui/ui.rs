@@ -328,6 +328,10 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .map(|ip| format!("({ip})"))
                 .unwrap_or_default()
         )),
+        Line::from(format!(
+            "History: {}",
+            if app.history_disabled() { "off (anon)" } else { "on" }
+        )),
     ];
 
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true }).block(
@@ -513,7 +517,29 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (total_lines, cursor_line, cursor_col) = measure_input(&app.input, input_width as usize);
     let scroll = total_lines.saturating_sub(input_height as usize);
     let visible_cursor_line = cursor_line.saturating_sub(scroll);
-    let input = Paragraph::new(app.input.as_str())
+    let input_content: Vec<Line<'_>> = if app.mode == Mode::Chat && app.input.starts_with("d/") {
+        app.input
+            .lines()
+            .enumerate()
+            .map(|(idx, line)| {
+                if idx == 0 {
+                    let rest = line.strip_prefix("d/").unwrap_or(line);
+                    Line::from(vec![
+                        Span::styled("d/", Style::default().fg(Color::White)),
+                        Span::styled(rest, Style::default().fg(CRIMSON)),
+                    ])
+                } else {
+                    Line::from(Span::styled(line, Style::default().fg(CRIMSON)))
+                }
+            })
+            .collect()
+    } else {
+        app.input
+            .lines()
+            .map(|line| Line::from(line.to_string()))
+            .collect()
+    };
+    let input = Paragraph::new(input_content)
         .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0))
         .style(Style::default().fg(Color::White))
@@ -524,7 +550,21 @@ fn draw_input(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .border_style(Style::default().fg(app.accent)),
         );
     frame.render_widget(input, rows[0]);
-    let status = Paragraph::new(app.status_line.as_str())
+        let status_text = if app.mode == Mode::Chat {
+            if let Some(rest) = app.input.strip_prefix("d/") {
+                let trimmed = rest.trim();
+                if trimmed.is_empty() {
+                    "Commands: d/clear, d/save, d/search, d/mark, d/last, d/status, d/purge, d/anon, d/help, d/history"
+                } else {
+                    app.status_line.as_str()
+                }
+            } else {
+                app.status_line.as_str()
+        }
+    } else {
+        app.status_line.as_str()
+    };
+    let status = Paragraph::new(status_text)
         .wrap(Wrap { trim: true })
         .block(Block::default().borders(Borders::NONE));
     frame.render_widget(status, rows[1]);
