@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use arboard::Clipboard;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -49,6 +51,7 @@ pub struct App {
     pub chat_focus: bool,
     pub selected_message: Option<usize>,
     pub marked_messages: HashSet<usize>,
+    clipboard: Option<Clipboard>,
     download_dir: PathBuf,
     offer_queue: VecDeque<FileOfferNotice>,
     active_offer: Option<FileOfferNotice>,
@@ -82,6 +85,7 @@ impl App {
             chat_focus: false,
             selected_message: None,
             marked_messages: HashSet::new(),
+            clipboard: Clipboard::new().ok(),
             download_dir: config.paths.download_dir.clone(),
             offer_queue: VecDeque::new(),
             active_offer: None,
@@ -397,58 +401,107 @@ impl App {
             self.show_warning("Press Ctrl+G to browse chat first.");
             return;
         }
+        let (payload, count) = match self.build_copy_payload() {
+            Ok(payload) => payload,
+            Err(msg) => {
+                self.show_warning(msg);
+                return;
+            }
+        };
+        match self.copy_payload_to_clipboard(&payload) {
+            Ok(_) => {
+                self.status_line = if count == 1 {
+                    "Copied message".into()
+                } else {
+                    format!("Copied {count} messages")
+                };
+                self.marked_messages.clear();
+                self.leave_chat_focus();
+            }
+            Err(err) => {
+                self.show_error(err);
+            }
+        }
+    }
+
+    fn build_copy_payload(&self) -> Result<(String, usize), &'static str> {
         if self.messages.is_empty() {
-            self.show_warning("No messages to copy.");
-            return;
+            return Err("No messages to copy.");
         }
         let mut targets: Vec<usize> = if self.marked_messages.is_empty() {
             match self.selected_message {
                 Some(idx) => vec![idx],
-                None => {
-                    self.show_warning("No message selected.");
-                    return;
-                }
+                None => return Err("No message selected."),
             }
         } else {
             self.marked_messages.iter().copied().collect()
         };
-        targets.sort_unstable();
+        targets.sort_unstable_by(|a, b| b.cmp(a));
         targets.dedup();
-        let mut payloads: Vec<String> = Vec::new();
-        for idx in targets.into_iter() {
-            if let Some(entry) = self.messages.get(idx) {
-                payloads.push(entry.text.clone());
-            }
+        let texts = targets
+            .into_iter()
+            .filter_map(|idx| self.messages.get(idx))
+            .map(|entry| entry.text.clone())
+            .collect::<Vec<_>>();
+        if texts.is_empty() {
+            return Err("Selected messages are unavailable.");
         }
-        if payloads.is_empty() {
-            self.show_warning("Selected messages are unavailable.");
-            self.clamp_selection();
-            return;
+        let count = texts.len();
+        Ok((texts.join("\n"), count))
+    }
+
+    fn ensure_clipboard(&mut self) -> Option<&mut Clipboard> {
+        if self.clipboard.is_none() {
+            self.clipboard = Clipboard::new().ok();
         }
-        let payload = payloads.join("\n");
-        match Clipboard::new().and_then(|mut clip| clip.set_text(payload)) {
-            Ok(_) => {
-                if self.marked_messages.is_empty() {
-                    if let Some(idx) = self.selected_message {
-                        if let Some(entry) = self.messages.get(idx) {
-                            self.status_line = format!("Copied message from {}", entry.author);
-                        } else {
-                            self.status_line = "Copied message".into();
-                        }
-                    } else {
-                        self.status_line = "Copied message".into();
-                    }
-                } else {
-                    self.status_line = format!(
-                        "Copied {} marked message{}",
-                        self.marked_messages.len(),
-                        if self.marked_messages.len() == 1 { "" } else { "s" }
-                    );
+        self.clipboard.as_mut()
+    }
+
+    fn copy_payload_to_clipboard(&mut self, payload: &str) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        if let Some(clip) = self.ensure_clipboard() {
+            match clip.set_text(payload.to_string()) {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    errors.push(format!("arboard: {err}"));
+                    // Force a new handle next attempt in case the backend died.
+                    self.clipboard = None;
                 }
             }
-            Err(err) => {
-                self.show_error(format!("Clipboard error: {err}"));
-            }
+        }
+        match self.try_command_clipboard("wl-copy", &["-n"], payload) {
+            Ok(_) => return Ok(()),
+            Err(err) => errors.push(format!("wl-copy: {err}")),
+        }
+        match self.try_command_clipboard("xclip", &["-selection", "clipboard"], payload) {
+            Ok(_) => return Ok(()),
+            Err(err) => errors.push(format!("xclip: {err}")),
+        }
+        if errors.is_empty() {
+            Err("Clipboard unavailable".into())
+        } else {
+            Err(errors.join(" · "))
+        }
+    }
+
+    fn try_command_clipboard(&self, bin: &str, args: &[&str], payload: &str) -> io::Result<()> {
+        let mut child = Command::new(bin)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(payload.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("{bin} failed with status {status}"),
+            ))
         }
     }
 
@@ -1128,5 +1181,49 @@ mod tests {
             app.commit_input(),
             Some(ServiceCommand::Listen { addr, password }) if addr.port() == 6000 && password == Some("secret".into())
         ));
+    }
+
+    fn sample_message(text: &str) -> ChatEntry {
+        ChatEntry {
+            direction: MessageDirection::System,
+            author: "system".into(),
+            text: text.into(),
+            timestamp: OffsetDateTime::now_utc(),
+        }
+    }
+
+    #[test]
+    fn build_copy_payload_uses_marked_descending() {
+        let config = AppConfig::default();
+        let args = TuiCommand::default();
+        let mut app = App::new(&config, &args);
+        app.messages = vec![
+            sample_message("first"),
+            sample_message("second"),
+            sample_message("third"),
+        ];
+        app.marked_messages.insert(0);
+        app.marked_messages.insert(2);
+
+        let (payload, count) = app.build_copy_payload().expect("payload");
+        assert_eq!(count, 2);
+        assert_eq!(payload, "third\nfirst");
+    }
+
+    #[test]
+    fn build_copy_payload_uses_selection_when_unmarked() {
+        let config = AppConfig::default();
+        let args = TuiCommand::default();
+        let mut app = App::new(&config, &args);
+        app.messages = vec![
+            sample_message("alpha"),
+            sample_message("beta"),
+            sample_message("gamma"),
+        ];
+        app.selected_message = Some(1);
+
+        let (payload, count) = app.build_copy_payload().expect("payload");
+        assert_eq!(count, 1);
+        assert_eq!(payload, "beta");
     }
 }

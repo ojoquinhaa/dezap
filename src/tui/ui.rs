@@ -112,8 +112,8 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
             state.select(Some(selected));
         }
     } else if has_items {
-        *state.offset_mut() = list_offset_from_bottom(&heights, view_height);
         state.select(None);
+        *state.offset_mut() = list_offset_from_bottom(&heights, view_height);
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -493,4 +493,57 @@ fn measure_input(text: &str, width: usize) -> (usize, usize, usize) {
         }
     }
     (total_lines, cursor_line, cursor_col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::AppConfig, tui::App};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn chat_scrolls_to_latest_message() {
+        let config = AppConfig::default();
+        let args = crate::cli::TuiCommand::default();
+        let mut app = App::new(&config, &args);
+        // Fill enough entries to force the list to scroll.
+        for idx in 0..20 {
+            app.messages.push(super::super::app::ChatEntry {
+                direction: super::super::app::MessageDirection::System,
+                author: "system".into(),
+                text: format!("msg #{idx}"),
+                timestamp: time::OffsetDateTime::now_utc(),
+            });
+        }
+
+        let backend = TestBackend::new(80, 18);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area().height, 18);
+                draw_messages(frame, frame.area(), &app)
+            })
+            .expect("render messages");
+
+        let buffer = terminal.backend().buffer();
+        let contents = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_string())
+            .collect::<String>();
+        let seen_msgs: Vec<u8> = contents
+            .split("msg #")
+            .skip(1)
+            .filter_map(|chunk| chunk.split_whitespace().next())
+            .filter_map(|num| num.parse::<u8>().ok())
+            .collect();
+        let seen = seen_msgs.iter().copied().max();
+        assert_eq!(
+            seen,
+            Some(19),
+            "latest message should be visible when list overflows (visible: {:?})",
+            seen_msgs
+        );
+    }
 }

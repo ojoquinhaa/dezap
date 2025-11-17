@@ -2,8 +2,8 @@ use std::io;
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
-use tracing_subscriber::{fmt, EnvFilter};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::config::LoggingConfig;
 
